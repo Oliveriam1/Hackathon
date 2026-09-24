@@ -45,6 +45,7 @@ def main() -> int:
                 frame = np.full((480, 640, 3), 35, dtype=np.uint8)
                 cv2.rectangle(frame, (100, 100), (220, 220), (0, 200, 0), -1)
                 cv2.circle(frame, (460, 300), 45, (0, 0, 230), -1)
+                cv2.rectangle(frame, (370, 210), (570, 400), (220, 220, 220), 3)
             elif args.image is not None:
                 frame = cv2.imdecode(np.fromfile(args.image, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
@@ -67,7 +68,7 @@ def main() -> int:
             show_edges = False
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             window_created = True
-            print("Detekce koleček. 1/2/3: citlivost, E: hrany, Q / Escape: konec.")
+            print("Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.")
             while True:
                 observation = vision.observe(frame)
                 background = cv2.cvtColor(vision.detector.edges, cv2.COLOR_GRAY2BGR) if show_edges else frame
@@ -76,6 +77,8 @@ def main() -> int:
                 key = cv2.waitKey(20) & 0xFF
                 if key in (ord('1'), ord('2'), ord('3')):
                     vision.detector.sensitivity = int(chr(key))
+                if key in (ord('b'), ord('B')):
+                    vision.detector.sensitivity = 1.5
                 if key in (ord('e'), ord('E')):
                     show_edges = not show_edges
                 if key in (ord("q"), ord("Q"), 27):
