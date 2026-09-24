@@ -4,7 +4,8 @@ import cv2
 
 
 class Camera:
-    def __init__(self, index: int = 0):
+    def __init__(self, index: int | str = 0):
+        """Index kamery, nebo cesta k videozáznamu."""
         self.index = index
         self._capture = None
 
@@ -14,6 +15,8 @@ class Camera:
         capture = cv2.VideoCapture(self.index)
         if not capture.isOpened():
             capture.release()
+            if isinstance(self.index, str):
+                raise RuntimeError(f"Video {self.index} nelze otevřít.")
             raise RuntimeError(
                 f"Kameru s indexem {self.index} nelze otevřít. "
                 "Zkontrolujte připojení, oprávnění ke kameře a zda ji nepoužívá jiný program. "

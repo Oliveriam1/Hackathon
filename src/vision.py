@@ -1,86 +1,125 @@
-"""Pouze kruhové objekty, bez barevné reference a letových povelů."""
+"""Kolečko uvnitř čtyřúhelníku, bez barevné reference a letových povelů."""
 from dataclasses import dataclass
 import cv2
 import math
+import numpy as np
 import time
 from .circle_detector import Circle, CircleDetector
 from .rectangle_detector import find_rectangles, enclosing_rectangle, find_faint_quadrilaterals
+from .tracker import TargetTracker
+
+MIN_AXIS_RATIO = 0.35  # elipsa kolečka až při ~70° od kolmého pohledu
 
 
 @dataclass(frozen=True)
 class Observation:
-    circles: list[Circle]
+    circles: list[Circle]       # kandidáti "kolečko v obdélníku" v tomto snímku
     status: str
     rectangles: list
-    confirmed: bool
+    confirmed: bool             # potvrzený cíl, i během krátkého výpadku
     processing_ms: float
+    target: Circle | None = None   # vyhlazená poloha potvrzeného cíle
+    measured: bool = False      # False = poloha je jen predikce
+    frame_size: tuple[int, int] | None = None  # (šířka, výška)
+
+    @property
+    def offset(self):
+        """Odchylka cíle od středu obrazu, -1..1, kladně vpravo a dolů."""
+        if self.target is None or self.frame_size is None:
+            return None
+        width, height = self.frame_size
+        return (self.target.x - width/2) / (width/2), (self.target.y - height/2) / (height/2)
 
 
 class Vision:
     def __init__(self):
         self.detector = CircleDetector()
+        self.tracker = TargetTracker()
         self.reset()
 
     def reset(self):
-        self.previous = None
-        self.hits = 0
+        self.tracker.reset()
         self.previous_shape = None
         self.previous_sensitivity = None
 
     def observe(self, frame):
         started = time.perf_counter()
         gray, edges = self.detector.prepare(frame)
+        if self.previous_shape != frame.shape or self.previous_sensitivity != self.detector.sensitivity:
+            self.reset()
+        self.previous_shape = frame.shape
+        self.previous_sensitivity = self.detector.sensitivity
         rectangles = find_rectangles(edges)
         if not rectangles:
             rectangles = find_faint_quadrilaterals(frame)
         candidates = []
         for rectangle in rectangles:
-            x, y, width, height = cv2.boundingRect(rectangle)
-            # Předzpracování je společné. Drahé hledání kruhů jen v oblasti terče.
-            circles = self.detector.detect_prepared(gray[y:y+height, x:x+width],
-                                                    edges[y:y+height, x:x+width])
-            for local in circles:
-                circle = Circle(local.x+x, local.y+y, local.radius)
-                if enclosing_rectangle(circle, [rectangle]) is None:
-                    continue
-                if any(math.hypot(circle.x-old.x, circle.y-old.y) < max(4, old.radius*0.15)
+            for circle in self._circles_in(gray, edges, rectangle):
+                if any(math.hypot(circle.x-old.x, circle.y-old.y) < max(4, old.radius*0.2)
                        for old in candidates):
                     continue
                 candidates.append(circle)
-        if self.previous_shape != frame.shape or self.previous_sensitivity != self.detector.sensitivity:
-            self.reset()
-        self.previous_shape = frame.shape
-        self.previous_sensitivity = self.detector.sensitivity
-        confirmed = False
-        if len(candidates) == 1:
-            current = candidates[0]
-            same = (self.previous is not None
-                    and math.hypot(current.x-self.previous.x, current.y-self.previous.y) < max(15, current.radius*0.75)
-                    and 0.7 < current.radius/self.previous.radius < 1.4)
-            self.hits = self.hits + 1 if same else 1
-            self.previous = current
-            confirmed = self.hits >= 4
-            status = 'TERC POTVRZEN' if confirmed else f'KANDIDAT {self.hits}/4'
-        else:
-            self.previous = None
-            self.hits = 0
-            status = 'VICE KANDIDATU' if candidates else 'HLEDAM KOLECKO VE CTYRUHELNIKU'
+        state = self.tracker.update(candidates, lambda prediction: self._circles_near(gray, edges, prediction))
         elapsed = (time.perf_counter()-started)*1000
-        return Observation(candidates, f'{status} | {elapsed:.0f} ms', rectangles, confirmed, elapsed)
+        height, width = frame.shape[:2]
+        return Observation(candidates, f'{state.status} | {elapsed:.0f} ms', rectangles, state.confirmed,
+                           elapsed, state.target, state.measured, (width, height))
+
+    def _circles_in(self, gray, edges, rectangle):
+        x, y, width, height = cv2.boundingRect(rectangle)
+        mask = np.zeros((height, width), np.uint8)
+        cv2.fillPoly(mask, [(rectangle - (x, y)).astype(np.int32)], 255)
+        # Rezerva: okraj obdélníku ani kolečko, které se ho dotýká, nepatří dovnitř.
+        mask = cv2.erode(mask, np.ones((5, 5), np.uint8))
+        # Předzpracování je společné. Drahé hledání kruhů jen v oblasti terče.
+        circles = self.detector.detect_prepared(gray[y:y+height, x:x+width], edges[y:y+height, x:x+width],
+                                                mask, MIN_AXIS_RATIO)
+        return [circle.shifted(x, y) for circle in circles
+                if enclosing_rectangle(circle.shifted(x, y), [rectangle]) is not None]
+
+    def _circles_near(self, gray, edges, prediction):
+        """Samotná kolečka kolem predikce; smí jen udržet již potvrzený cíl."""
+        reach = int(2.5*prediction.radius) + 10
+        frame_height, frame_width = gray.shape
+        x0, y0 = max(0, int(prediction.x) - reach), max(0, int(prediction.y) - reach)
+        x1, y1 = min(frame_width, int(prediction.x) + reach), min(frame_height, int(prediction.y) + reach)
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            return []
+        circles = self.detector.detect_prepared(gray[y0:y1, x0:x1], edges[y0:y1, x0:x1],
+                                                min_axis_ratio=MIN_AXIS_RATIO)
+        return [circle.shifted(x0, y0) for circle in circles]
+
+
+def _draw_ellipse(image, circle, color, thickness):
+    center = (round(circle.x), round(circle.y))
+    axes = (max(1, round(circle.radius)), max(1, round(circle.minor_radius)))
+    cv2.ellipse(image, center, axes, circle.angle, 0, 360, color, thickness)
+    return center
+
+
+def _text(image, text, origin, color, scale):
+    # Tmavý obrys: čitelné i na světlém podkladu.
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3)
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1)
 
 
 def annotate_observation(image, observation):
     output = image.copy()
+    height, width = output.shape[:2]
     for rectangle in observation.rectangles:
         cv2.polylines(output, [rectangle], True, (255, 180, 0), 1)
-    color = (0, 255, 0) if observation.confirmed else (0, 255, 255)
     for circle in observation.circles:
-        center = (round(circle.x), round(circle.y))
-        cv2.circle(output, center, round(circle.radius), color, 2)
+        _draw_ellipse(output, circle, (0, 255, 255), 1)
+    image_center = (width // 2, height // 2)
+    cv2.drawMarker(output, image_center, (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
+    target = observation.target
+    if target is not None:
+        # Zelená = změřeno v tomto snímku, oranžová = predikce během výpadku.
+        color = (0, 255, 0) if observation.measured else (0, 165, 255)
+        center = _draw_ellipse(output, target, color, 2)
         cv2.drawMarker(output, center, color, cv2.MARKER_CROSS, 12, 1)
-        cv2.putText(output, f'{center[0]}, {center[1]}',
-                    (max(0, center[0]-35), max(15, center[1]-round(circle.radius)-8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    cv2.putText(output, observation.status, (10, output.shape[0]-15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.line(output, image_center, center, color, 1)
+        dx, dy = observation.offset
+        _text(output, f'{center[0]}, {center[1]} px  odchylka {dx:+.2f} {dy:+.2f}', (10, 20), color, 0.5)
+    _text(output, observation.status, (10, height-15), (255, 255, 255), 0.6)
     return output

@@ -19,6 +19,7 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--camera", type=int, default=0, help="Index kamery (výchozí: 0).")
     source.add_argument("--image", type=Path, help="Obrázek místo živé kamery.")
+    source.add_argument("--video", type=Path, help="Videozáznam místo živé kamery, např. z letu.")
     source.add_argument("--demo", action="store_true", help="Testovací obraz bez kamery.")
     source.add_argument("--picamera", type=int, metavar="INDEX", help="CSI kamera přes Picamera2, např. --picamera 0.")
     parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
@@ -50,6 +51,11 @@ def main() -> int:
                 frame = cv2.imdecode(np.fromfile(args.image, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
                     raise RuntimeError("Soubor nelze načíst jako obrázek.")
+            elif args.video is not None:
+                if not args.video.is_file():
+                    raise RuntimeError("Videosoubor neexistuje.")
+                camera = stack.enter_context(Camera(str(args.video)))
+                frame = camera.read()
             else:
                 device = PiCamera(args.picamera, ev=args.ev if args.ev is not None else 0.0) if args.picamera is not None else Camera(args.camera)
                 camera = stack.enter_context(device)
@@ -86,7 +92,12 @@ def main() -> int:
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                     break
                 if camera is not None:
-                    frame = camera.read()
+                    try:
+                        frame = camera.read()
+                    except RuntimeError:
+                        if args.video is None:
+                            raise
+                        break  # konec záznamu
     except KeyboardInterrupt:
         pass
     except (RuntimeError, ValueError, OSError, cv2.error) as error:
