@@ -13,6 +13,9 @@ class FlightController(Protocol):
 
     abort() must stop the mission using the platform's configured contingency;
     no universal land/hover/return command is assumed here.
+    For live monitoring, get_telemetry() must return a thread-safe cached sample
+    promptly, even while execute() waits for completion. The adapter owns all
+    serial/protocol I/O; the video server does not read the flight link directly.
     """
     def get_telemetry(self) -> UAVTelemetry: ...
     def execute(self, command: FlightCommand, timeout_s: float) -> None: ...

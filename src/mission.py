@@ -62,16 +62,24 @@ class MissionController:
     def __init__(self, config: MissionConfig, flight: FlightController, camera: MissionCamera,
                  detector: CircleDetector, publisher: Publisher, *,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 on_state: Callable[[MissionState], None] | None = None) -> None:
         self.config, self.flight, self.camera = config, flight, camera
         self.detector, self.publisher = detector, publisher
         self.clock, self.sleep = clock, sleep
+        self.on_state = on_state
         self.history = [MissionState.INIT]
         self._used = False
 
     def _state(self, state: MissionState) -> None:
         self.history.append(state)
         logger.info("STATE: %s", state.value)
+        if self.on_state is not None:
+            # Observers only copy status; a display error must not alter flight.
+            try:
+                self.on_state(state)
+            except Exception:
+                logger.exception("Mission state observer failed")
 
     def run(self) -> MissionReport:
         """Run once. Every failure stops progression, aborts the adapter and closes camera."""

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import logging
+import time
 
 import cv2
 import numpy as np
@@ -48,6 +49,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--udp-host", help="Explicit destination PC IPv4 address for mission JSON.")
     parser.add_argument("--udp-port", type=int, default=5005)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--stream", action="store_true", help="Headless MJPEG video; keep open until Ctrl+C.")
+    parser.add_argument("--stream-host", default="127.0.0.1", help="HTTP bind address; use 0.0.0.0 for LAN access.")
+    parser.add_argument("--stream-port", type=int, default=5000)
+    parser.add_argument("--stream-fps", type=float, default=30, help="Capture/stream rate limit (default: 30 FPS).")
     return parser.parse_args()
 
 
@@ -67,12 +72,63 @@ def run_mission(args: argparse.Namespace) -> int:
     frame = load_image(args.image) if args.image is not None else make_demo()
     logging.info("SIMULATED MISSION: no flight commands will reach hardware")
     publisher = UDPPublisher(args.udp_host, args.udp_port) if args.udp_host else ConsolePublisher()
-    controller = MissionController(config, SimulatedFlightController(config.start),
-                                   StaticImageCamera(frame), CircleInQuadrilateralDetector(), publisher)
-    report = controller.run()
+    flight, source = SimulatedFlightController(config.start), StaticImageCamera(frame)
+    if args.stream:
+        from src.live_camera import BufferedCamera, StreamingDetector
+        from src.streaming import LiveVideo
+
+        # Start in INIT, before opening the camera or executing any motion intent.
+        with LiveVideo(args.stream_host, args.stream_port, fps=args.stream_fps,
+                       get_telemetry=flight.get_telemetry) as video:
+            camera = BufferedCamera(source, lambda: source.read(timeout_s=1), video, fps=args.stream_fps)
+            detector = StreamingDetector(CircleInQuadrilateralDetector(), camera, video)
+            controller = MissionController(config, flight, camera, detector, publisher, on_state=video.set_state)
+            report = controller.run()
+            if report.state == MissionState.COMPLETE:
+                logging.info("Mission complete; final frame remains available until Ctrl+C (camera stopped)")
+                try:
+                    while True:
+                        time.sleep(0.5)
+                except KeyboardInterrupt:
+                    pass
+    else:
+        controller = MissionController(config, flight, source, CircleInQuadrilateralDetector(), publisher)
+        report = controller.run()
     if report.error:
         logging.error("Mission stopped: %s", report.error)
     return 0 if report.state == MissionState.COMPLETE else 1
+
+
+def run_video_preview(args: argparse.Namespace) -> int:
+    """Headless video with capture independent of detector latency; no flight commands."""
+    from src.live_camera import BufferedCamera, StreamingDetector
+    from src.models import MissionState
+    from src.simulation import StaticImageCamera
+    from src.streaming import LiveVideo
+
+    if args.snapshot:
+        raise ValueError("Choose either --snapshot or --stream")
+    if args.demo or args.image is not None:
+        frame = load_image(args.image) if args.image is not None else make_demo()
+        source = StaticImageCamera(frame)
+        read_frame = lambda: source.read(timeout_s=1)
+        logging.info("Video source: static test scene; telemetry unavailable")
+    else:
+        source = PiCamera(args.camera_index, width=args.width, height=args.height)
+        read_frame = source.read
+        logging.info("Video source: Picamera2 %dx%d; telemetry unavailable", args.width, args.height)
+    with LiveVideo(args.stream_host, args.stream_port, fps=args.stream_fps) as video:
+        camera = BufferedCamera(source, read_frame, video, fps=args.stream_fps)
+        detector = StreamingDetector(CircleInQuadrilateralDetector(), camera, video)
+        try:
+            camera.open()
+            video.set_state(MissionState.SCANNING)
+            while True:
+                detector.detect(camera.read(timeout_s=2))
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            camera.close()
 
 
 def main() -> int:
@@ -90,6 +146,14 @@ def main() -> int:
     if args.udp_host:
         logging.error("--udp-host is only used with a mission")
         return 1
+    if args.stream:
+        try:
+            return run_video_preview(args)
+        except KeyboardInterrupt:
+            return 0
+        except Exception:
+            logging.exception("Live video failed")
+            return 1
     detector = CircleInQuadrilateralDetector()
     camera = None
     window_name = "IR circle in quadrilateral - Q/Esc to exit"

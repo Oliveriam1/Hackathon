@@ -11,6 +11,64 @@ visible-spectrum information or guarantee detection in every infrared scene.
 Pi capture explicitly enables automatic exposure/white balance and uses BGR
 output (`RGB888` in Picamera2), without an extra channel swap.
 
+## Live video in a browser
+
+No GUI window or additional web framework is needed. Test on a generated scene:
+
+```bash
+python main.py --demo --stream
+```
+
+Open **http://127.0.0.1:5000/** (viewer) or
+**http://127.0.0.1:5000/video_feed** (MJPEG endpoint). Stop with **Ctrl+C**.
+The demo repeats a synthetic image; GPS/AGL are explicitly unavailable.
+
+Stream the real Raspberry Pi camera over your local network:
+
+```bash
+python main.py --stream --stream-host 0.0.0.0 --stream-port 5000 --stream-fps 30
+```
+
+On the operator PC, open `http://<raspberry-pi-IP>:5000/`. The default bind address
+is localhost; `0.0.0.0` makes it reachable over the LAN. This is a small local
+monitor without authentication or TLS, intended for a trusted network.
+
+To monitor the simulated mission, including its mock GPS and AGL:
+
+```bash
+python main.py --dry-run --stream
+```
+
+The server starts in **INIT**, before the camera opens or any simulated movement.
+The simulator completes commands instantly, so intermediate states can pass
+too quickly to see. After success, the browser remains available until Ctrl+C,
+with the final frame labelled **CAMERA: STOPPED**. Without `--stream`, the mission
+still exits immediately as before. Failed missions return exit code 1.
+
+Overlay includes mission state, AGL, latitude/longitude, detection status, the
+enclosing quadrilateral, circle and center. Preview uses state SCANNING and
+does not invent telemetry. Analysis runs independently of capture/encoding;
+the latest detection is shown with its source-frame age. Old geometry is hidden
+after one second, and missing/stale camera or telemetry data are labelled.
+These overlays are for monitoring, not timestamp synchronization for geolocation.
+
+The implementation uses Python's `ThreadingHTTPServer` and Motion JPEG:
+
+- One worker owns camera capture. Analysis reads a fresh frame from a single
+  latest-frame buffer, without opening the camera a second time.
+- Separate workers encode JPEGs and poll cached telemetry. Blocking analysis or
+  `FlightController.execute()` does not stop capture or browser playback.
+- Each HTTP client has its own handler; slow clients skip frames and blocked
+  writes time out. There is no unbounded frame queue.
+- `--stream-fps` limits acquisition/encoding to 30 FPS by default. Actual FPS
+  depends on resolution, camera, CPU and network; detection may run more slowly.
+
+`get_telemetry()` must return a thread-safe cached sample promptly even during
+motion. A real adapter must update that cache separately from flight commands.
+`BufferedCamera` requires bounded reads for mission use; a stuck hardware driver
+is reported as stale video/read timeout. The Pi preview backend still has a
+blocking device read and has not been promoted to a real flight adapter.
+
 ## Complete mission without hardware
 
 ```bash
@@ -58,6 +116,8 @@ acknowledged receipt. Nothing is transmitted on import or during normal camera p
 - `publisher.py`: console/UDP JSON output.
 - `mission.py`: dependency-injected controller and timeout/error handling.
 - `simulation.py`: fake flight controller and static-image camera.
+- `streaming.py`: MJPEG server, telemetry overlay and bounded latest-frame store.
+- `live_camera.py`: background camera capture and detector-to-overlay adapter.
 
 ```text
 INIT → MOVING_TO_B → CALCULATING_CENTER → ASCENDING → SCANNING
@@ -141,6 +201,19 @@ homographies, with a ±5 pixel assertion per axis. They are synthetic, not field
 validation. Regenerate them using `python tests/make_fixtures.py`.
 The end-to-end test runs the simulated mission and receives the actual JSON on
 a loopback UDP socket at `127.0.0.1`; it requires local socket permission.
+
+Live-stream tests also use loopback HTTP (no camera/UAV). Run the 30 FPS dummy
+generator/consumer test with measured throughput output:
+
+```bash
+python -m pytest -q -s tests/test_streaming.py
+```
+
+It decodes actual multipart JPEGs while another client does not read and a
+navigation loop keeps updating. Other tests block analysis and a flight command,
+check that fresh frames continue, verify overlays/stale-data handling, simulate
+camera loss, and check socket/camera cleanup. Timing assertions allow scheduler
+variation; these tests are not a Raspberry Pi performance benchmark.
 
 ## Raspberry Pi setup
 
