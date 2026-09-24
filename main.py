@@ -64,14 +64,20 @@ def main() -> int:
                 print(f'Snímek uložen: {args.snapshot.resolve()}')
                 return 0
             vision = Vision()
+            show_edges = False
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             window_created = True
-            print("Detekce koleček podle tvaru. Q / Escape: konec.")
+            print("Detekce koleček. 1/2/3: citlivost, E: hrany, Q / Escape: konec.")
             while True:
                 observation = vision.observe(frame)
-                image = annotate_observation(frame, observation)
+                background = cv2.cvtColor(vision.detector.edges, cv2.COLOR_GRAY2BGR) if show_edges else frame
+                image = annotate_observation(background, observation)
                 cv2.imshow(window_name, image)
                 key = cv2.waitKey(20) & 0xFF
+                if key in (ord('1'), ord('2'), ord('3')):
+                    vision.detector.sensitivity = int(chr(key))
+                if key in (ord('e'), ord('E')):
+                    show_edges = not show_edges
                 if key in (ord("q"), ord("Q"), 27):
                     break
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:

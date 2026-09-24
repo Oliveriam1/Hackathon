@@ -16,7 +16,7 @@ class Vision:
 
     def observe(self, frame):
         circles = self.detector.detect(frame)
-        return Observation(circles, f'KOLECKA: {len(circles)}')
+        return Observation(circles, f'KOLECKA: {len(circles)} | citlivost {self.detector.sensitivity} (1-3) | E: hrany')
 
 
 def annotate_observation(image, observation):
