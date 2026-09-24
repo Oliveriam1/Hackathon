@@ -14,6 +14,7 @@ from src.camera import Camera
 from src.pi_camera import PiCamera
 from src.vision import Vision, annotate_observation
 from src.publisher import JSONPublisher, detection_record
+from src.target_lock import TargetLock
 
 
 def parse_args():
@@ -92,6 +93,7 @@ def main() -> int:
                 camera = stack.enter_context(device)
                 frame = camera.read()
             received_at = time.time()
+            sample_time = time.monotonic()
             if args.snapshot:
                 extension = args.snapshot.suffix.lower()
                 if extension not in ('.jpg', '.jpeg', '.png'):
@@ -103,6 +105,7 @@ def main() -> int:
                 print(f'Snímek uložen: {args.snapshot.resolve()}')
                 return 0
             vision = Vision()
+            target_lock = TargetLock()
             stream = stack.enter_context(args.output.open('a', encoding='utf-8')) if args.output else sys.stdout
             publisher = JSONPublisher(stream)
             source_name = 'static' if camera is None else ('video' if args.video else 'camera')
@@ -120,6 +123,8 @@ def main() -> int:
                     record = detection_record(observation, sequence=sequence,
                                               received_at=received_at, source=source_name)
                     record['telemetry'] = telemetry.snapshot() if telemetry is not None else None
+                    record['visual_lock'] = target_lock.update(observation, sample_time=sample_time,
+                                                              now=time.monotonic())
                     record['autonomy'] = {'enabled': False, 'state': 'NOT_IMPLEMENTED',
                                           'missing': ['flight_adapter', 'zone_boundary', 'gimbal_feedback',
                                                       'exposure_telemetry_synchronization']}
@@ -134,6 +139,7 @@ def main() -> int:
                     except EOFError:
                         break
                     received_at = time.time()
+                    sample_time = time.monotonic()
                     continue
                 background = cv2.cvtColor(vision.detector.edges, cv2.COLOR_GRAY2BGR) if show_edges else frame
                 image = annotate_observation(background, observation)
@@ -156,6 +162,7 @@ def main() -> int:
                     try:
                         frame = camera.read()
                         received_at = time.time()
+                        sample_time = time.monotonic()
                     except EOFError:
                         break  # konec záznamu
     except KeyboardInterrupt:
