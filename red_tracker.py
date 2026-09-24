@@ -142,6 +142,7 @@ def find_red_target(frame_bgr, lo1=RED_LOWER_1, hi1=RED_UPPER_1, lo2=RED_LOWER_2
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best, best_area = None, 0
+    valid_count = 0
     for c in contours:
         area = cv2.contourArea(c)
         if area < MIN_AREA_PX:
@@ -152,14 +153,15 @@ def find_red_target(frame_bgr, lo1=RED_LOWER_1, hi1=RED_UPPER_1, lo2=RED_LOWER_2
             continue
         if area > best_area:
             best, best_area = c, area
+        valid_count += 1
     if best is None:
-        return None, 0, mask
+        return None, 0, mask, 0
 
     m = cv2.moments(best)
     cx, cy = m["m10"] / m["m00"], m["m01"] / m["m00"]
     _, r = cv2.minEnclosingCircle(best)
     s = 1.0 / PROCESS_SCALE
-    return (cx * s, cy * s), r * s, mask
+    return (cx * s, cy * s), r * s, mask, valid_count
 
 
 def pixel_to_angles(dx, dy, w, h):
@@ -183,7 +185,7 @@ def tune_mode(cam):
         g = lambda n: cv2.getTrackbarPos(n, win)
         lo1 = np.array([g("H1lo"), g("Smin"), g("Vmin")]); hi1 = np.array([g("H1hi"), 255, 255])
         lo2 = np.array([g("H2lo"), g("Smin"), g("Vmin")]); hi2 = np.array([g("H2hi"), 255, 255])
-        _, _, mask = find_red_target(frame, lo1, hi1, lo2, hi2)
+        _, _, mask, _ = find_red_target(frame, lo1, hi1, lo2, hi2)
         cv2.imshow(win, np.hstack([cv2.resize(frame, (mask.shape[1], mask.shape[0])),
                                    cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)]))
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -212,6 +214,7 @@ def main():
     prev_err = (0.0, 0.0)
     last_seen = 0.0
     t_prev, fps = time.time(), 0.0
+    last_valid_count = -1
 
     try:
         while True:
@@ -220,8 +223,13 @@ def main():
                 continue
             h, w = frame.shape[:2]
             center = (w / 2, h / 2)
-            pos, radius, _ = find_red_target(frame)
+            pos, radius, _, valid_count = find_red_target(frame)
             now = time.time()
+            
+            if valid_count != last_valid_count:
+                if valid_count > 0 and pos is not None:
+                    print(f"INFO: Viditelne kruhy: {valid_count}, Stred: ({pos[0]:.1f}, {pos[1]:.1f})")
+                last_valid_count = valid_count
 
             if pos is not None:
                 last_seen = now
@@ -262,6 +270,16 @@ def main():
                 fps = 0.9 * fps + 0.1 * (1 / dt)
 
             if args.show:
+                cv2.putText(
+                    frame,
+                    f"Detekovano kruhu: {valid_count}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA
+                )
                 cx, cy = int(center[0]), int(center[1])
                 cv2.drawMarker(frame, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
                 if pos is not None:

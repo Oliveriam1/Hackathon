@@ -157,10 +157,10 @@ class CircleInQuadrilateralDetector:
         warped = cv2.warpPerspective(gray, transform, (width, height))
         return warped, transform
 
-    def _find_best_circle(self, warped: np.ndarray) -> tuple[float, float, float, float] | None:
+    def _find_circles(self, warped: np.ndarray) -> list[tuple[float, float, float, float]]:
         h, w = warped.shape
         if min(h, w) < 40:
-            return None
+            return []
 
         work = cv2.GaussianBlur(warped, (5, 5), 1.2)
         edges = cv2.Canny(work, 35, 110)
@@ -209,10 +209,7 @@ class CircleInQuadrilateralDetector:
             score = float(min(1.0, circularity) if circularity <= 1.0 else 1.0 / circularity)
             candidates.append((float(x), float(y), float(radius), score))
 
-        if not candidates:
-            return None
-
-        return max(candidates, key=lambda item: item[3])
+        return candidates
 
     def detect(self, frame: np.ndarray, *, largest_only: bool = False) -> DetectionResult:
         gray = self.to_gray(frame)
@@ -222,29 +219,28 @@ class CircleInQuadrilateralDetector:
         targets: list[Target] = []
         for quad in quadrilaterals[:1] if largest_only else quadrilaterals:
             warped, transform = self._warp_quad(gray, quad)
-            circle = self._find_best_circle(warped)
-            if circle is None:
-                continue
+            circles = self._find_circles(warped)
+            
+            for circle in circles:
+                x, y, radius, confidence = circle
+                inverse = np.linalg.inv(transform)
+                point = np.array([[[x, y]]], dtype=np.float32)
+                center_original = cv2.perspectiveTransform(point, inverse)[0, 0]
 
-            x, y, radius, confidence = circle
-            inverse = np.linalg.inv(transform)
-            point = np.array([[[x, y]]], dtype=np.float32)
-            center_original = cv2.perspectiveTransform(point, inverse)[0, 0]
+                # Radius is mapped approximately using a second point on the x axis.
+                radius_point = np.array([[[x + radius, y]]], dtype=np.float32)
+                radius_original = cv2.perspectiveTransform(radius_point, inverse)[0, 0]
+                radius_px = float(np.linalg.norm(radius_original - center_original))
 
-            # Radius is mapped approximately using a second point on the x axis.
-            radius_point = np.array([[[x + radius, y]]], dtype=np.float32)
-            radius_original = cv2.perspectiveTransform(radius_point, inverse)[0, 0]
-            radius_px = float(np.linalg.norm(radius_original - center_original))
-
-            quad_points = tuple(Point(float(px), float(py)) for px, py in quad)
-            targets.append(
-                Target(
-                    center=Point(float(center_original[0]), float(center_original[1])),
-                    radius_px=radius_px,
-                    quadrilateral=quad_points,  # type: ignore[arg-type]
-                    confidence=confidence,
+                quad_points = tuple(Point(float(px), float(py)) for px, py in quad)
+                targets.append(
+                    Target(
+                        center=Point(float(center_original[0]), float(center_original[1])),
+                        radius_px=radius_px,
+                        quadrilateral=quad_points,  # type: ignore[arg-type]
+                        confidence=confidence,
+                    )
                 )
-            )
 
         # De-duplicate nested/duplicate edge contours describing the same marker.
         unique: list[Target] = []

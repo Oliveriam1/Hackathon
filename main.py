@@ -22,6 +22,7 @@ def make_demo() -> np.ndarray:
     quad = np.array([[270, 150], [1020, 185], [930, 610], [220, 565]], np.int32)
     cv2.polylines(image, [quad], True, (220, 220, 220), 8)
     cv2.circle(image, (620, 380), 72, (35, 35, 35), 8)
+    cv2.circle(image, (820, 480), 55, (35, 35, 35), 8) # Second circle
     return image
 
 
@@ -130,16 +131,27 @@ def main() -> int:
             raise RuntimeError("No graphical display. Use --snapshot output.jpg when running headless/SSH.")
 
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        last_target_count = -1
+
         while True:
             result = detector.detect(frame)
             output = annotate(frame, result)
+            
+            target_count = len(result.targets)
+            if target_count != last_target_count:
+                if target_count > 0:
+                    center_x = result.targets[0].center.x
+                    center_y = result.targets[0].center.y
+                    logging.info(f"DETEKCE: Viditelné kruhy: {target_count}. Střed nejbližšího kruhu: ({center_x:.1f}, {center_y:.1f})")
+                last_target_count = target_count
+
             cv2.putText(
                 output,
-                f"targets: {len(result.targets)} | quads: {result.quadrilateral_count}",
+                f"Kruhy v zornem poli: {target_count}",
                 (12, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (255, 255, 255),
+                (0, 255, 0),
                 2,
                 cv2.LINE_AA,
             )

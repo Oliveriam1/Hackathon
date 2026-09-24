@@ -18,6 +18,8 @@ def run_test():
 
     print(f"Starting native UI test. Press 'q' or 'Esc' to exit.")
 
+    last_target_count = -1
+
     while True:
         if not is_demo:
             ret, frame = cap.read()
@@ -33,8 +35,28 @@ def run_test():
         ]
 
         result = detector.detect(frame)
+        target_count = len(result.targets)
+        
+        if target_count != last_target_count:
+            if target_count > 0:
+                center_x = result.targets[0].center.x
+                center_y = result.targets[0].center.y
+                print(f"INFO DETEKCE: Viditelné kruhy: {target_count}. Střed nejbližšího kruhu: ({center_x:.1f}, {center_y:.1f})")
+            last_target_count = target_count
+
         output = annotate(frame, result, telemetry_lines=telemetry)
         
+        cv2.putText(
+            output,
+            f"Kruhy v zornem poli: {target_count}",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
         cv2.imshow(window_name, output)
 
         key = cv2.waitKey(1) & 0xFF
