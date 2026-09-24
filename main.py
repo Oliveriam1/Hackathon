@@ -30,11 +30,18 @@ def parse_args():
     parser.add_argument('--frames', type=int, help='Ukončit po daném počtu nových snímků.')
     parser.add_argument('--width', type=int, default=640, help='Šířka CSI snímku.')
     parser.add_argument('--height', type=int, default=480, help='Výška CSI snímku.')
+    parser.add_argument('--mavlink', help='Port/endpoint ArduPilotu; jen telemetrie, např. /dev/ttyACM0.')
+    parser.add_argument('--baud', type=int, default=115200, help='Rychlost sériového MAVLink spojení.')
+    parser.add_argument('--target-system', type=int, help='Očekávané MAVLink system ID autopilota.')
     parser.add_argument('--ev', type=float, default=None,
                         help='Kompenzace expozice CSI kamery, např. --ev -2. Výchozí 0; AWB auto.')
     args = parser.parse_args()
     if args.frames is not None and args.frames < 1:
         parser.error('--frames musí být kladné.')
+    if args.baud <= 0 or (args.target_system is not None and not 1 <= args.target_system <= 255):
+        parser.error('Neplatné --baud nebo --target-system.')
+    if args.mavlink and (args.demo or args.image or args.video or args.snapshot):
+        parser.error('--mavlink připojujte pouze k živé detekci, nikoliv k záznamu nebo fotografii.')
     if args.width < 1 or args.height < 1:
         parser.error('Rozlišení musí být kladné.')
     if args.output and any(path and path.resolve() == args.output.resolve() for path in (args.image, args.video)):
@@ -60,6 +67,10 @@ def main() -> int:
         if not args.snapshot and not args.headless and sys.platform.startswith('linux') and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
             raise RuntimeError('Není dostupná grafická plocha. Přes SSH použijte --snapshot test.jpg.')
         with ExitStack() as stack:
+            telemetry = None
+            if args.mavlink:
+                from src.telemetry import MAVLinkTelemetry
+                telemetry = stack.enter_context(MAVLinkTelemetry(args.mavlink, args.baud, args.target_system))
             camera = None
             if args.demo:
                 frame = np.full((480, 640, 3), 35, dtype=np.uint8)
@@ -106,8 +117,13 @@ def main() -> int:
                 if observation is None or camera is not None:
                     observation = vision.observe(frame)
                     sequence += 1
-                    publisher.publish(detection_record(observation, sequence=sequence,
-                                                       received_at=received_at, source=source_name))
+                    record = detection_record(observation, sequence=sequence,
+                                              received_at=received_at, source=source_name)
+                    record['telemetry'] = telemetry.snapshot() if telemetry is not None else None
+                    record['autonomy'] = {'enabled': False, 'state': 'NOT_IMPLEMENTED',
+                                          'missing': ['flight_adapter', 'zone_boundary', 'gimbal_feedback',
+                                                      'exposure_telemetry_synchronization']}
+                    publisher.publish(record)
                 if args.frames is not None and sequence >= args.frames:
                     break
                 if args.headless:
