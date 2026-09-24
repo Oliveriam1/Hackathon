@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime data
+captures/*
+logs/*
+
+# Environment variables
+.env
+
+# Models / large files
+*.pt
+*.onnx
