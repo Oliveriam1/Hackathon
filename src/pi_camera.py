@@ -89,12 +89,12 @@ class PiCamera:
 
         camera = Picamera2(camera_num=self.index)
         try:
-            # RGB888 gives a normal HxWx3 uint8 NumPy array. The detector does
-            # not depend on RGB vs BGR channel order because it converts to
-            # channel-order-independent intensity before geometry processing.
+            # Picamera2 RGB888 gives BGR bytes, as OpenCV expects. The detector
+            # uses channel-order-independent intensity before geometry processing.
             config = camera.create_video_configuration(
                 main={"size": (self.width, self.height), "format": "RGB888"},
                 buffer_count=4,
+                controls={"AwbEnable": True, "AeEnable": True},
             )
             camera.configure(config)
             camera.start()

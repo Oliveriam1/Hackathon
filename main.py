@@ -1,4 +1,4 @@
-"""Find a circle enclosed by a rectangle/quadrilateral using a Raspberry Pi CSI camera."""
+"""Circle-in-quadrilateral camera preview or a simulated scan-and-report mission."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import logging
 
 import cv2
 import numpy as np
@@ -42,11 +43,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--snapshot", type=Path, help="Save one annotated frame and exit.")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate the complete mission without UAV/camera hardware.")
+    parser.add_argument("--mission", type=Path, help="Mission JSON (flight adapter required outside dry-run).")
+    parser.add_argument("--udp-host", help="Explicit destination PC IPv4 address for mission JSON.")
+    parser.add_argument("--udp-port", type=int, default=5005)
+    parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
+
+
+def run_mission(args: argparse.Namespace) -> int:
+    from src.config import load_mission_config
+    from src.mission import MissionController
+    from src.models import MissionState
+    from src.publisher import ConsolePublisher, UDPPublisher
+    from src.simulation import SimulatedFlightController, StaticImageCamera
+
+    if not args.dry_run:
+        raise RuntimeError("Real flight-controller adapter is not configured. Use --dry-run to simulate the mission.")
+    if args.snapshot:
+        raise ValueError("--snapshot belongs to camera preview, not the mission")
+    config_path = args.mission or Path(__file__).parent / "config" / "mission.example.json"
+    config = load_mission_config(config_path)
+    frame = load_image(args.image) if args.image is not None else make_demo()
+    logging.info("SIMULATED MISSION: no flight commands will reach hardware")
+    publisher = UDPPublisher(args.udp_host, args.udp_port) if args.udp_host else ConsolePublisher()
+    controller = MissionController(config, SimulatedFlightController(config.start),
+                                   StaticImageCamera(frame), CircleInQuadrilateralDetector(), publisher)
+    report = controller.run()
+    if report.error:
+        logging.error("Mission stopped: %s", report.error)
+    return 0 if report.state == MissionState.COMPLETE else 1
 
 
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+                        format="%(levelname)s %(message)s")
+    if args.dry_run or args.mission is not None:
+        try:
+            return run_mission(args)
+        except KeyboardInterrupt:
+            return 130
+        except Exception:
+            logging.exception("Mission initialization failed")
+            return 1
+    if args.udp_host:
+        logging.error("--udp-host is only used with a mission")
+        return 1
     detector = CircleInQuadrilateralDetector()
     camera = None
     window_name = "IR circle in quadrilateral - Q/Esc to exit"

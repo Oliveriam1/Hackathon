@@ -13,11 +13,7 @@ import math
 import cv2
 import numpy as np
 
-
-@dataclass(frozen=True, slots=True)
-class Point:
-    x: float
-    y: float
+from .models import Point
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,13 +244,13 @@ class CircleInQuadrilateralDetector:
 
         return max(candidates, key=lambda item: item[3])
 
-    def detect(self, frame: np.ndarray) -> DetectionResult:
+    def detect(self, frame: np.ndarray, *, largest_only: bool = False) -> DetectionResult:
         gray = self.to_gray(frame)
         _, edges = self._preprocess(gray)
         quadrilaterals = self._find_quadrilaterals(edges)
 
         targets: list[Target] = []
-        for quad in quadrilaterals:
+        for quad in quadrilaterals[:1] if largest_only else quadrilaterals:
             warped, transform = self._warp_quad(gray, quad)
             circle = self._find_best_circle(warped)
             if circle is None:
@@ -292,6 +288,15 @@ class CircleInQuadrilateralDetector:
             unique.append(candidate)
 
         return DetectionResult(tuple(unique), len(quadrilaterals))
+
+    def detect_circle(self, frame: np.ndarray) -> Point | None:
+        """Return the circle center in the largest quadrilateral, or None.
+
+        Preserve detect() for callers that want all markers. The mission uses
+        this method so a smaller unrelated marker cannot replace the scan ROI.
+        """
+        result = self.detect(frame, largest_only=True)
+        return result.targets[0].center if result.targets else None
 
 
 def annotate(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
