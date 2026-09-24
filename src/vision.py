@@ -4,7 +4,7 @@ import cv2
 import math
 import time
 from .circle_detector import Circle, CircleDetector
-from .rectangle_detector import find_rectangles, enclosing_rectangle
+from .rectangle_detector import find_rectangles, enclosing_rectangle, find_faint_quadrilaterals
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,8 @@ class Vision:
         started = time.perf_counter()
         gray, edges = self.detector.prepare(frame)
         rectangles = find_rectangles(edges)
+        if not rectangles:
+            rectangles = find_faint_quadrilaterals(frame)
         candidates = []
         for rectangle in rectangles:
             x, y, width, height = cv2.boundingRect(rectangle)

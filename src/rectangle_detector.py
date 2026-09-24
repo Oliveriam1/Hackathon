@@ -33,3 +33,26 @@ def enclosing_rectangle(circle, rectangles):
     matches = [rect for rect in rectangles
                if cv2.pointPolygonTest(rect, (circle.x, circle.y), True) > circle.radius + 2]
     return min(matches, key=cv2.contourArea) if matches else None
+
+
+def find_faint_quadrilaterals(frame):
+    """Záloha pro dlouhé slabé hrany s malými mezerami v rozích."""
+    gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 1)
+    edges = cv2.Canny(gray, 5, 15)
+    size = min(gray.shape)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=40,
+                           minLineLength=max(40, int(size*0.25)),
+                           maxLineGap=max(10, int(size*0.1)))
+    if lines is None:
+        return []
+    segments = lines.reshape(-1, 4)
+    lengths = np.linalg.norm(segments[:, 2:] - segments[:, :2], axis=1)
+    canvas = np.zeros_like(gray)
+    # Omezený počet segmentů i prodloužení: nespojujeme vzdálené nesouvisející hrany.
+    for index in np.argsort(lengths)[-60:]:
+        start = segments[index, :2].astype(float)
+        end = segments[index, 2:].astype(float)
+        direction = (end-start)/lengths[index]*max(5, size*0.025)
+        cv2.line(canvas, tuple(np.rint(start-direction).astype(int)),
+                 tuple(np.rint(end+direction).astype(int)), 255, 3)
+    return find_rectangles(canvas)
