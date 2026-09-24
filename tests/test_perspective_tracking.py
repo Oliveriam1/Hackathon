@@ -41,6 +41,25 @@ class PerspectiveTests(unittest.TestCase):
                 with self.subTest(style=style, tilt=tilt):
                     self.assertGreaterEqual(hits, 3 if tilt <= 45 else 2)
 
+    def test_real_size_target_from_five_meters_in_hd(self):
+        # Kolečko 200 mm ve čtverci 35 cm, výška 5 m, 1280 x 720, kamera nakloněná servy.
+        size = (1280, 720)
+        for tilt in (0, 30, 45, 60):
+            hits = 0
+            for seed in range(3):
+                rng = np.random.default_rng(seed)
+                homography = camera_homography(rng.uniform(4.5, 5.5), tilt, rng.uniform(0, 360), rng.uniform(-10, 10),
+                                               (rng.uniform(-.3, .3), rng.uniform(-.3, .3)), size=size, hfov_deg=53.5)
+                frame = render(world('small_sheet'), homography, size, blur=rng.uniform(0.5, 1.2),
+                               noise=rng.uniform(3, 7), gain=rng.uniform(0.8, 1.1), seed=seed)
+                truth = project(homography, (0, 0))
+                distances = [math.dist((c.x, c.y), truth) for c in Vision().observe(frame).circles]
+                with self.subTest(tilt=tilt, seed=seed):
+                    self.assertTrue(all(d < 8 for d in distances), 'falešný kandidát')
+                hits += any(d < 8 for d in distances)
+            with self.subTest(tilt=tilt):
+                self.assertGreaterEqual(hits, 2)
+
     def test_decoys_are_never_candidates(self):
         # Samotné kolečko, prázdný list, čtverec v listu, samotný prstenec.
         for decoy in ((-2.0, -1.4), (2.0, -1.4), (-2.0, 1.2), (2.0, 1.1)):
@@ -108,6 +127,20 @@ class TrackingTests(unittest.TestCase):
         # Samotné kolečko nikdy nezačne nový cíl.
         for _ in range(2 * CONFIRM_HITS):
             self.assertFalse(vision.observe(scene(rectangle=False)).confirmed)
+
+    def test_confirmed_target_is_tracked_in_region_only(self):
+        vision = self.confirmed_vision()
+        for index in range(1, 8):
+            observation = vision.observe(scene(offset=index*4))
+            x0, y0, x1, y1 = observation.region
+            self.assertLess((x1 - x0) * (y1 - y0), 500 * 300)
+            self.assertTrue(observation.measured)
+            self.assertAlmostEqual(observation.target.x, 170 + index*4, delta=4)
+        # Po ztrátě cíle se znovu hledá v celém snímku.
+        blank = np.zeros_like(scene())
+        for _ in range(3):
+            observation = vision.observe(blank)
+        self.assertEqual(observation.region, (0, 0, 500, 300))
 
     def test_offset_from_image_center(self):
         observation = self.confirmed_vision().observe(scene())

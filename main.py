@@ -1,10 +1,19 @@
-"""Živý náhled kamery. Ukončení klávesou Q, Escape nebo zavřením okna."""
+"""Kolečko v obdélníku: náhled kamery, webový stream nebo simulovaná mise.
+
+Zdroj: CSI kamera Pi (výchozí), --camera (USB/OpenCV), --video, --image, --demo.
+Okno s náhledem (Q/Esc konec), --stream (MJPEG v prohlížeči), --snapshot,
+--dry-run (celá mise bez hardwaru). Detekci dělá src.vision.Vision.
+"""
+
+from __future__ import annotations
 
 import argparse
-import sys
+import logging
+import math
 import os
-from contextlib import ExitStack
 from pathlib import Path
+import sys
+import time
 
 import cv2
 import numpy as np
@@ -14,99 +23,233 @@ from src.pi_camera import PiCamera
 from src.vision import Vision, annotate_observation
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--camera", type=int, default=0, help="Index kamery (výchozí: 0).")
-    source.add_argument("--image", type=Path, help="Obrázek místo živé kamery.")
-    source.add_argument("--video", type=Path, help="Videozáznam místo živé kamery, např. z letu.")
-    source.add_argument("--demo", action="store_true", help="Testovací obraz bez kamery.")
-    source.add_argument("--picamera", type=int, metavar="INDEX", help="CSI kamera přes Picamera2, např. --picamera 0.")
-    parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
-    parser.add_argument('--ev', type=float, default=None,
-                        help='Kompenzace expozice CSI kamery, např. --ev -2. Výchozí 0; AWB auto.')
-    args = parser.parse_args()
-    if args.camera < 0:
-        parser.error("Index kamery musí být nezáporný.")
-    if args.picamera is not None and args.picamera < 0:
-        parser.error("Index CSI kamery musí být nezáporný.")
-    if args.ev is not None and args.picamera is None:
-        parser.error('--ev lze použít pouze s --picamera.')
-    if args.ev is not None and (not np.isfinite(args.ev) or not -8 <= args.ev <= 8):
-        parser.error('--ev musí být v rozsahu -8 až 8.')
+def make_demo() -> np.ndarray:
+    """Synthetic grayscale-like scene used only to verify the detector without hardware."""
+    image = np.full((720, 1280, 3), 115, dtype=np.uint8)
+    quad = np.array([[270, 150], [1020, 185], [930, 610], [220, 565]], np.int32)
+    cv2.polylines(image, [quad], True, (220, 220, 220), 8)
+    cv2.circle(image, (620, 380), 72, (35, 35, 35), 8)
+    return image
 
+
+def load_image(path: Path) -> np.ndarray:
+    data = np.fromfile(path, dtype=np.uint8)
+    frame = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if frame is None:
+        raise RuntimeError(f"Cannot load image: {path}")
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    return frame[:, :, :3]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--picamera", "--camera-index", dest="picamera", type=int, metavar="INDEX",
+                        help="CSI kamera přes Picamera2 (výchozí zdroj, index 0).")
+    source.add_argument("--camera", type=int, metavar="INDEX", help="USB/OpenCV kamera, např. na PC.")
+    source.add_argument("--video", type=Path, help="Videozáznam místo kamery, např. z letu.")
+    source.add_argument("--image", type=Path, help="Obrázek místo kamery.")
+    source.add_argument("--demo", action="store_true", help="Vygenerovaná testovací scéna.")
+    parser.add_argument("--width", type=int, default=1280, help="Šířka obrazu CSI kamery (výchozí 1280).")
+    parser.add_argument("--height", type=int, default=720, help="Výška obrazu CSI kamery (výchozí 720).")
+    parser.add_argument("--ev", type=float, default=0.0, help="Kompenzace expozice CSI kamery, např. --ev -2.")
+    parser.add_argument("--snapshot", type=Path, help="Uloží jeden označený snímek a skončí.")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate the complete mission without UAV/camera hardware.")
+    parser.add_argument("--mission", type=Path, help="Mission JSON (flight adapter required outside dry-run).")
+    parser.add_argument("--udp-host", help="Explicit destination PC IPv4 address for mission JSON.")
+    parser.add_argument("--udp-port", type=int, default=5005)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--stream", action="store_true", help="Headless MJPEG video; keep open until Ctrl+C.")
+    parser.add_argument("--stream-host", default="127.0.0.1", help="HTTP bind address; use 0.0.0.0 for LAN access.")
+    parser.add_argument("--stream-port", type=int, default=5000)
+    parser.add_argument("--stream-fps", type=float, default=30, help="Capture/stream rate limit (default: 30 FPS).")
+    args = parser.parse_args()
+    for name in ("picamera", "camera"):
+        if getattr(args, name) is not None and getattr(args, name) < 0:
+            parser.error(f"--{name} musí být nezáporný index.")
+    if not math.isfinite(args.ev) or not -8 <= args.ev <= 8:
+        parser.error("--ev musí být v rozsahu -8 až 8.")
+    if args.ev and (args.camera is not None or args.video or args.image or args.demo):
+        parser.error("--ev platí jen pro CSI kameru.")
+    return args
+
+
+def open_source(args: argparse.Namespace):
+    """-> (zařízení s open/close nebo None, čtení snímku). Statický obraz se opakuje."""
+    from src.simulation import StaticImageCamera
+
+    if args.demo or args.image is not None:
+        source = StaticImageCamera(load_image(args.image) if args.image is not None else make_demo())
+        return source, lambda: source.read(timeout_s=1)
+    if args.video is not None:
+        if not args.video.is_file():
+            raise RuntimeError("Videosoubor neexistuje.")
+        source = Camera(str(args.video))
+        if args.stream:
+            def read_looping():
+                try:
+                    return source.read()
+                except RuntimeError:
+                    source.rewind()  # ve streamu hraje záznam dokola
+                    return source.read()
+            return source, read_looping
+    elif args.camera is not None:
+        source = Camera(args.camera)
+    else:
+        source = PiCamera(args.picamera or 0, width=args.width, height=args.height, ev=args.ev)
+    return source, source.read
+
+
+def run_mission(args: argparse.Namespace) -> int:
+    from src.config import load_mission_config
+    from src.mission import MissionController
+    from src.models import MissionState
+    from src.publisher import ConsolePublisher, UDPPublisher
+    from src.simulation import SimulatedFlightController, StaticImageCamera
+
+    if not args.dry_run:
+        raise RuntimeError("Real flight-controller adapter is not configured. Use --dry-run to simulate the mission.")
+    if args.snapshot:
+        raise ValueError("--snapshot belongs to camera preview, not the mission")
+    config_path = args.mission or Path(__file__).parent / "config" / "mission.example.json"
+    config = load_mission_config(config_path)
+    frame = load_image(args.image) if args.image is not None else make_demo()
+    logging.info("SIMULATED MISSION: no flight commands will reach hardware")
+    publisher = UDPPublisher(args.udp_host, args.udp_port) if args.udp_host else ConsolePublisher()
+    flight, source = SimulatedFlightController(config.start), StaticImageCamera(frame)
+    if args.stream:
+        from src.live_camera import BufferedCamera, StreamingDetector
+        from src.streaming import LiveVideo
+
+        # Start in INIT, before opening the camera or executing any motion intent.
+        with LiveVideo(args.stream_host, args.stream_port, fps=args.stream_fps,
+                       get_telemetry=flight.get_telemetry) as video:
+            camera = BufferedCamera(source, lambda: source.read(timeout_s=1), video, fps=args.stream_fps)
+            detector = StreamingDetector(Vision(), camera, video)
+            controller = MissionController(config, flight, camera, detector, publisher, on_state=video.set_state)
+            report = controller.run()
+            if report.state == MissionState.COMPLETE:
+                logging.info("Mission complete; final frame remains available until Ctrl+C (camera stopped)")
+                try:
+                    while True:
+                        time.sleep(0.5)
+                except KeyboardInterrupt:
+                    pass
+    else:
+        controller = MissionController(config, flight, source, Vision(), publisher)
+        report = controller.run()
+    if report.error:
+        logging.error("Mission stopped: %s", report.error)
+    return 0 if report.state == MissionState.COMPLETE else 1
+
+
+def run_video_preview(args: argparse.Namespace) -> int:
+    """Webový stream: kamera, detekce a prohlížeč běží nezávisle; žádné letové povely."""
+    from src.live_camera import BufferedCamera, StreamingDetector
+    from src.models import MissionState
+    from src.streaming import LiveVideo
+
+    if args.snapshot:
+        raise ValueError("Choose either --snapshot or --stream")
+    source, read_frame = open_source(args)
+    logging.info("Video source: %s; telemetry unavailable", type(source).__name__)
+    with LiveVideo(args.stream_host, args.stream_port, fps=args.stream_fps) as video:
+        camera = BufferedCamera(source, read_frame, video, fps=args.stream_fps)
+        detector = StreamingDetector(Vision(), camera, video)
+        try:
+            camera.open()
+            video.set_state(MissionState.SCANNING)
+            while True:
+                detector.detect(camera.read(timeout_s=2))
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            camera.close()
+
+
+def run_window(args: argparse.Namespace) -> int:
+    """Náhled v okně nebo jeden snímek (--snapshot); klávesy 1/2/3/B citlivost, E hrany."""
+    if not args.snapshot and sys.platform.startswith("linux") and not (
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        raise RuntimeError("Není dostupná grafická plocha. Přes SSH použijte --stream nebo --snapshot test.jpg.")
+    source, read_frame = open_source(args)
+    live = not (args.demo or args.image is not None)
     window_name = "Kamera - Q / Esc: konec"
     window_created = False
+    source.open()
     try:
-        if not args.snapshot and sys.platform.startswith('linux') and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
-            raise RuntimeError('Není dostupná grafická plocha. Přes SSH použijte --snapshot test.jpg.')
-        with ExitStack() as stack:
-            camera = None
-            if args.demo:
-                frame = np.full((480, 640, 3), 35, dtype=np.uint8)
-                cv2.rectangle(frame, (100, 100), (220, 220), (0, 200, 0), -1)
-                cv2.circle(frame, (460, 300), 45, (0, 0, 230), -1)
-                cv2.rectangle(frame, (370, 210), (570, 400), (220, 220, 220), 3)
-            elif args.image is not None:
-                frame = cv2.imdecode(np.fromfile(args.image, dtype=np.uint8), cv2.IMREAD_COLOR)
-                if frame is None:
-                    raise RuntimeError("Soubor nelze načíst jako obrázek.")
-            elif args.video is not None:
-                if not args.video.is_file():
-                    raise RuntimeError("Videosoubor neexistuje.")
-                camera = stack.enter_context(Camera(str(args.video)))
-                frame = camera.read()
-            else:
-                device = PiCamera(args.picamera, ev=args.ev if args.ev is not None else 0.0) if args.picamera is not None else Camera(args.camera)
-                camera = stack.enter_context(device)
-                frame = camera.read()
-            if args.snapshot:
-                extension = args.snapshot.suffix.lower()
-                if extension not in ('.jpg', '.jpeg', '.png'):
-                    raise RuntimeError('Snímek musí mít příponu .jpg, .jpeg nebo .png.')
-                success, encoded = cv2.imencode(extension, frame)
-                if not success:
-                    raise RuntimeError('Snímek se nepodařilo zakódovat.')
-                encoded.tofile(args.snapshot)
-                print(f'Snímek uložen: {args.snapshot.resolve()}')
-                return 0
-            vision = Vision()
-            show_edges = False
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            window_created = True
-            print("Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.")
-            while True:
-                observation = vision.observe(frame)
-                background = cv2.cvtColor(vision.detector.edges, cv2.COLOR_GRAY2BGR) if show_edges else frame
-                image = annotate_observation(background, observation)
-                cv2.imshow(window_name, image)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord('1'), ord('2'), ord('3')):
-                    vision.detector.sensitivity = int(chr(key))
-                if key in (ord('b'), ord('B')):
-                    vision.detector.sensitivity = 1.5
-                if key in (ord('e'), ord('E')):
-                    show_edges = not show_edges
-                if key in (ord("q"), ord("Q"), 27):
-                    break
-                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-                if camera is not None:
-                    try:
-                        frame = camera.read()
-                    except RuntimeError:
-                        if args.video is None:
-                            raise
-                        break  # konec záznamu
-    except KeyboardInterrupt:
-        pass
-    except (RuntimeError, ValueError, OSError, cv2.error) as error:
-        print(f"Chyba náhledu: {error}", file=sys.stderr)
-        return 1
+        vision = Vision()
+        frame = read_frame()
+        if args.snapshot:
+            extension = args.snapshot.suffix.lower()
+            if extension not in (".jpg", ".jpeg", ".png"):
+                raise ValueError("Snímek musí mít příponu .jpg, .jpeg nebo .png.")
+            observation = vision.observe(frame)
+            success, encoded = cv2.imencode(extension, annotate_observation(frame, observation))
+            if not success:
+                raise RuntimeError("Snímek se nepodařilo zakódovat.")
+            encoded.tofile(args.snapshot)
+            print(observation.status)
+            for circle in observation.circles:
+                print(f"KOLECKO: x={circle.x:.1f}, y={circle.y:.1f}, r={circle.radius:.1f} px")
+            print(f"Snímek uložen: {args.snapshot.resolve()}")
+            return 0
+        show_edges = False
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        window_created = True
+        print("Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.")
+        while True:
+            observation = vision.observe(frame)
+            background = cv2.cvtColor(vision.edges, cv2.COLOR_GRAY2BGR) if show_edges else frame
+            cv2.imshow(window_name, annotate_observation(background, observation))
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("1"), ord("2"), ord("3")):
+                vision.detector.sensitivity = int(chr(key))
+            if key in (ord("b"), ord("B")):
+                vision.detector.sensitivity = 1.5
+            if key in (ord("e"), ord("E")):
+                show_edges = not show_edges
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            if live:
+                try:
+                    frame = read_frame()
+                except RuntimeError:
+                    if args.video is None:
+                        raise
+                    break  # konec záznamu
     finally:
+        source.close()
         if window_created:
             cv2.destroyAllWindows()
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+                        format="%(levelname)s %(message)s")
+    if args.dry_run or args.mission is not None:
+        try:
+            return run_mission(args)
+        except KeyboardInterrupt:
+            return 130
+        except Exception:
+            logging.exception("Mission initialization failed")
+            return 1
+    if args.udp_host:
+        logging.error("--udp-host is only used with a mission")
+        return 1
+    try:
+        return run_video_preview(args) if args.stream else run_window(args)
+    except KeyboardInterrupt:
+        return 0
+    except (RuntimeError, ValueError, OSError, TimeoutError, cv2.error) as error:
+        print(f"Chyba: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

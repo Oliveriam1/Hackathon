@@ -32,6 +32,11 @@ class Camera:
             raise RuntimeError("Nepodařilo se načíst snímek. Zkontrolujte připojení kamery.")
         return frame
 
+    def rewind(self):
+        """Videozáznam znovu od začátku."""
+        if self._capture is not None:
+            self._capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
     def close(self):
         if self._capture is not None:
             self._capture.release()

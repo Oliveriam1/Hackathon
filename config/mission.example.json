@@ -1,0 +1,22 @@
+{
+  "description": "SYNTHETIC simulation example only; these are not real site or camera parameters.",
+  "start": {"latitude": 50.0, "longitude": 14.0},
+  "destination": {"latitude": 50.0001, "longitude": 14.0001},
+  "corners": [
+    {"latitude": 50.00005, "longitude": 14.00005},
+    {"latitude": 50.00005, "longitude": 14.00025},
+    {"latitude": 50.0002, "longitude": 14.00025},
+    {"latitude": 50.0002, "longitude": 14.00005}
+  ],
+  "camera": {
+    "width": 1280, "height": 720,
+    "horizontal_fov_deg": 70.0, "vertical_fov_deg": 50.0,
+    "mount": {"roll_deg": 0.0, "pitch_deg": -90.0, "yaw_deg": 0.0}
+  },
+  "transit_altitude_agl_m": 5.0,
+  "max_altitude_agl_m": 40.0,
+  "coverage_margin": 1.1,
+  "scan_timeout_s": 60.0,
+  "command_timeout_s": 30.0,
+  "yaw_deg": 0.0
+}
