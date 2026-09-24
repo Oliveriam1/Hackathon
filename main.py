@@ -11,7 +11,6 @@ import numpy as np
 
 from src.camera import Camera
 from src.pi_camera import PiCamera
-from src.manual_target import ManualTarget
 from src.vision import Vision, annotate_observation
 
 
@@ -64,19 +63,15 @@ def main() -> int:
                 encoded.tofile(args.snapshot)
                 print(f'Snímek uložen: {args.snapshot.resolve()}')
                 return 0
-            target = ManualTarget()
             vision = Vision()
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             window_created = True
-            cv2.setMouseCallback(window_name, target.on_mouse)
-            print("Levý klik: označit bod. Pravý klik: zrušit. R: reset reference. Q / Escape: konec.")
+            print("Detekce koleček podle tvaru. Q / Escape: konec.")
             while True:
                 observation = vision.observe(frame)
-                image = annotate_observation(target.annotate(frame), observation)
+                image = annotate_observation(frame, observation)
                 cv2.imshow(window_name, image)
                 key = cv2.waitKey(20) & 0xFF
-                if key in (ord('r'), ord('R')):
-                    vision.reset()
                 if key in (ord("q"), ord("Q"), 27):
                     break
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
