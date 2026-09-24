@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .models import CenteringResult, ColorDetection, NormalizedPoint, Point
+from .color_calibration import default_profiles, color_mask
 
 
 # OpenCV uses hue 0..179 and saturation/value 0..255 for uint8 images.
@@ -35,6 +36,7 @@ class ColorDetector:
         if not math.isfinite(centering_tolerance_px) or centering_tolerance_px < 0:
             raise ValueError("centering_tolerance_px must be finite and non-negative")
         self.min_contour_area = min_contour_area
+        self.profiles = default_profiles()
         self.centering_tolerance_px = centering_tolerance_px
         self._kernel = np.ones(
             (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), dtype=np.uint8
@@ -58,7 +60,7 @@ class ColorDetector:
         """Return the largest green region, or None when none passes the filter."""
         self._validate_frame(frame)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
+        mask = color_mask(hsv, self.profiles['green'])
         detections = self._detect_regions(mask)
         return detections[0] if detections else None
 
@@ -66,9 +68,7 @@ class ColorDetector:
         """Return red regions from both hue ranges, sorted by decreasing area."""
         self._validate_frame(frame)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
-        mask2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
-        return self._detect_regions(mask1 | mask2)
+        return self._detect_regions(color_mask(hsv, self.profiles['red']))
 
     def _detect_regions(self, mask: np.ndarray) -> list[ColorDetection]:
         """Clean a binary mask and extract external contour centroids."""
