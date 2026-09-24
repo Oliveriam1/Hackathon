@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-host", default="127.0.0.1", help="HTTP bind address; use 0.0.0.0 for LAN access.")
     parser.add_argument("--stream-port", type=int, default=5000)
     parser.add_argument("--stream-fps", type=float, default=30, help="Capture/stream rate limit (default: 30 FPS).")
+    parser.add_argument("--detection-fps", type=float, default=8, help="Maximum full detections per second (default: 8).")
     return parser.parse_args()
 
 
@@ -81,9 +82,15 @@ def run_mission(args: argparse.Namespace) -> int:
         with LiveVideo(args.stream_host, args.stream_port, fps=args.stream_fps,
                        get_telemetry=flight.get_telemetry) as video:
             camera = BufferedCamera(source, lambda: source.read(timeout_s=1), video, fps=args.stream_fps)
-            detector = StreamingDetector(CircleInQuadrilateralDetector(), camera, video)
+            detector = StreamingDetector(CircleInQuadrilateralDetector(), camera, video,
+                                         detection_fps=args.detection_fps, tracking_fps=args.stream_fps,
+                                         largest_only=True)
             controller = MissionController(config, flight, camera, detector, publisher, on_state=video.set_state)
-            report = controller.run()
+            detector.start()
+            try:
+                report = controller.run()
+            finally:
+                detector.close()
             if report.state == MissionState.COMPLETE:
                 logging.info("Mission complete; final frame remains available until Ctrl+C (camera stopped)")
                 try:
@@ -119,15 +126,21 @@ def run_video_preview(args: argparse.Namespace) -> int:
         logging.info("Video source: Picamera2 %dx%d; telemetry unavailable", args.width, args.height)
     with LiveVideo(args.stream_host, args.stream_port, fps=args.stream_fps) as video:
         camera = BufferedCamera(source, read_frame, video, fps=args.stream_fps)
-        detector = StreamingDetector(CircleInQuadrilateralDetector(), camera, video)
+        detector = StreamingDetector(CircleInQuadrilateralDetector(), camera, video,
+                                     detection_fps=args.detection_fps, tracking_fps=args.stream_fps)
         try:
             camera.open()
             video.set_state(MissionState.SCANNING)
+            detector.start()
             while True:
-                detector.detect(camera.read(timeout_s=2))
+                # All image work belongs to capture/analysis/encoding workers.
+                if video.snapshot().camera_status == "ERROR":
+                    raise RuntimeError("Camera failed after frame recovery attempts")
+                time.sleep(0.1)
         except KeyboardInterrupt:
             return 0
         finally:
+            detector.close()
             camera.close()
 
 
@@ -135,6 +148,9 @@ def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(levelname)s %(message)s")
+    if args.stream:
+        # Avoid each OpenCV operation spawning another full CPU-sized pool.
+        cv2.setNumThreads(1)
     if args.dry_run or args.mission is not None:
         try:
             return run_mission(args)

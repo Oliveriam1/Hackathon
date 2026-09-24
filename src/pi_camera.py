@@ -115,13 +115,13 @@ class PiCamera:
 
         frame = self._camera.capture_array("main")
         if frame is None:
-            raise RuntimeError("Picamera2 returned no frame.")
+            raise ValueError("Picamera2 returned no frame.")
 
         frame = np.asarray(frame)
         if frame.size == 0:
-            raise RuntimeError("Picamera2 returned an empty frame.")
+            raise ValueError("Picamera2 returned an empty frame.")
         if frame.ndim != 3 or frame.shape[2] < 3:
-            raise RuntimeError(f"Unexpected Picamera2 frame shape: {frame.shape!r}")
+            raise ValueError(f"Unexpected Picamera2 frame shape: {frame.shape!r}")
 
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)

@@ -35,6 +35,9 @@ class VideoSnapshot:
     detection: DetectionResult | None
     detection_at: float
     camera_status: str
+    detection_sequence: int = 0
+    detection_shape: tuple[int, int] | None = None
+    detection_mode: str = "WAITING"
 
 
 def draw_overlay(snapshot: VideoSnapshot, *, now: float | None = None) -> np.ndarray:
@@ -49,7 +52,9 @@ def draw_overlay(snapshot: VideoSnapshot, *, now: float | None = None) -> np.nda
         frame = np.zeros((360, 640, 3), dtype=np.uint8)
     result = snapshot.detection
     detection_age = now - snapshot.detection_at
-    fresh_detection = result is not None and detection_age <= 1.0
+    fresh_detection = (result is not None and detection_age <= 1.0
+                       and snapshot.camera_status == "LIVE"
+                       and (snapshot.detection_shape is None or snapshot.detection_shape == frame.shape[:2]))
     output = annotate(frame, result if fresh_detection else DetectionResult((), 0))
     camera_status = snapshot.camera_status
     if snapshot.frame is not None and now - snapshot.captured_at > 1.0 and camera_status == "LIVE":
@@ -69,6 +74,7 @@ def draw_overlay(snapshot: VideoSnapshot, *, now: float | None = None) -> np.nda
         lines.append(f"DETECTION: STALE ({detection_age:.1f}s)")
     else:
         lines.append(f"CIRCLES: {len(result.targets)} | QUADS: {result.quadrilateral_count} | age: {detection_age:.2f}s")
+        lines.append(f"ANALYSIS: {snapshot.detection_mode}")
     # Darken only the small text area, keeping the underlying scene visible.
     panel_width = min(output.shape[1], 20 + max(
         cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0] for line in lines))
@@ -97,7 +103,7 @@ class LiveVideo:
             raise ValueError("Invalid stream port")
         self.host, self.port, self.fps = host, port, fps
         self._get_telemetry = get_telemetry
-        self._condition = threading.Condition()
+        self._condition = threading.Condition(threading.Lock())
         self._snapshot = VideoSnapshot(None, 0, 0, MissionState.INIT, None, 0, None, 0, "WAITING")
         self._jpeg: bytes | None = None
         self._jpeg_sequence = 0
@@ -125,8 +131,20 @@ class LiveVideo:
     def set_telemetry(self, telemetry: UAVTelemetry | None) -> None:
         self._update(telemetry=telemetry, telemetry_at=time.monotonic())
 
-    def set_detection(self, result: DetectionResult, captured_at: float) -> None:
-        self._update(detection=result, detection_at=captured_at)
+    def set_detection(self, result: DetectionResult, captured_at: float, *, sequence: int = 0,
+                      shape: tuple[int, int] | None = None, mode: str = "DETECTED") -> None:
+        self._update(detection=result, detection_at=captured_at, detection_sequence=sequence,
+                     detection_shape=shape, detection_mode=mode)
+
+    def wait_for_detection(self, sequence: int, timeout_s: float) -> VideoSnapshot:
+        """Mission consumers require a result from their frame or a newer frame."""
+        with self._condition:
+            ready = self._condition.wait_for(
+                lambda: self._snapshot.detection_sequence >= sequence or self._stop.is_set()
+                or self._snapshot.camera_status in ("ERROR", "STOPPED"), timeout_s)
+            if not ready:
+                raise TimeoutError("Timed out waiting for analysis")
+            return self._snapshot
 
     def publish_frame(self, frame: np.ndarray) -> None:
         """Own one immutable copy; producers never queue frames behind consumers."""
@@ -136,8 +154,9 @@ class LiveVideo:
         owned = frame[:, :, :3].copy() if frame.ndim == 3 else frame.copy()
         owned.setflags(write=False)
         with self._condition:
-            self._update(frame=owned, sequence=self._snapshot.sequence + 1,
-                         captured_at=time.monotonic(), camera_status="LIVE")
+            self._snapshot = replace(self._snapshot, frame=owned, sequence=self._snapshot.sequence + 1,
+                                     captured_at=time.monotonic(), camera_status="LIVE")
+            self._condition.notify_all()
 
     def wait_for_frame(self, after: int, timeout_s: float) -> VideoSnapshot:
         with self._condition:
@@ -226,6 +245,7 @@ class LiveVideo:
 
     def _encode_loop(self) -> None:
         next_frame_at = time.monotonic()
+        last_warning = -math.inf
         while not self._stop.is_set():
             try:
                 output = draw_overlay(self.snapshot())
@@ -236,6 +256,10 @@ class LiveVideo:
                 with self._condition:
                     self._jpeg, self._jpeg_sequence = jpeg, self._jpeg_sequence + 1
                     self._condition.notify_all()
+            except (cv2.error, ValueError):
+                if time.monotonic() - last_warning >= 5:
+                    logger.warning("Skipping invalid overlay/JPEG frame", exc_info=True)
+                    last_warning = time.monotonic()
             except Exception:
                 logger.exception("Video encoding stopped")
                 with self._condition:
