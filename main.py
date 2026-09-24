@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import os
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import cv2
 import numpy as np
 
 from src.camera import Camera
+from src.pi_camera import PiCamera
 from src.manual_target import ManualTarget
 from src.vision import Vision, annotate_observation
 
@@ -19,12 +21,19 @@ def main() -> int:
     source.add_argument("--camera", type=int, default=0, help="Index kamery (výchozí: 0).")
     source.add_argument("--image", type=Path, help="Obrázek místo živé kamery.")
     source.add_argument("--demo", action="store_true", help="Testovací obraz bez kamery.")
+    source.add_argument("--picamera", type=int, metavar="INDEX", help="CSI kamera přes Picamera2, např. --picamera 0.")
+    parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
     args = parser.parse_args()
     if args.camera < 0:
         parser.error("Index kamery musí být nezáporný.")
+    if args.picamera is not None and args.picamera < 0:
+        parser.error("Index CSI kamery musí být nezáporný.")
 
     window_name = "Kamera - Q / Esc: konec"
+    window_created = False
     try:
+        if not args.snapshot and sys.platform.startswith('linux') and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+            raise RuntimeError('Není dostupná grafická plocha. Přes SSH použijte --snapshot test.jpg.')
         with ExitStack() as stack:
             camera = None
             if args.demo:
@@ -36,11 +45,23 @@ def main() -> int:
                 if frame is None:
                     raise RuntimeError("Soubor nelze načíst jako obrázek.")
             else:
-                camera = stack.enter_context(Camera(args.camera))
+                device = PiCamera(args.picamera) if args.picamera is not None else Camera(args.camera)
+                camera = stack.enter_context(device)
                 frame = camera.read()
+            if args.snapshot:
+                extension = args.snapshot.suffix.lower()
+                if extension not in ('.jpg', '.jpeg', '.png'):
+                    raise RuntimeError('Snímek musí mít příponu .jpg, .jpeg nebo .png.')
+                success, encoded = cv2.imencode(extension, frame)
+                if not success:
+                    raise RuntimeError('Snímek se nepodařilo zakódovat.')
+                encoded.tofile(args.snapshot)
+                print(f'Snímek uložen: {args.snapshot.resolve()}')
+                return 0
             target = ManualTarget()
             vision = Vision()
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            window_created = True
             cv2.setMouseCallback(window_name, target.on_mouse)
             print("Levý klik: označit bod. Pravý klik: zrušit. R: reset reference. Q / Escape: konec.")
             while True:
@@ -61,7 +82,8 @@ def main() -> int:
         print(f"Chyba náhledu: {error}", file=sys.stderr)
         return 1
     finally:
-        cv2.destroyAllWindows()
+        if window_created:
+            cv2.destroyAllWindows()
     return 0
 
 
