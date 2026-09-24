@@ -31,6 +31,10 @@ def parse_args():
     parser.add_argument('--status', action='store_true', help='Čitelný stav 1x za sekundu místo JSON v terminálu.')
     parser.add_argument('--diagnostics', type=Path, help='Uloží nejvýše 30 dvojic raw/marked snímků, každé 2 s.')
     parser.add_argument('--sensitivity', type=float, choices=(1, 1.5, 2, 3), default=1.5)
+    parser.add_argument('--hough', action='store_true', help='Pomalá záloha pro přerušené kruhové hrany (pro porovnání).')
+    parser.add_argument('--detector', choices=('geometry', 'red'), default='geometry')
+    parser.add_argument('--red-diameter-px', type=float, help='Očekávaný průměr červené tečky v pixelech; jinak bez filtru velikosti.')
+    parser.add_argument('--tuning-file', help='CSI profil; režim red používá ov5647_noir.json. Hodnota none ponechá systémový profil.')
     parser.add_argument('--output', type=Path, help='Připojuje JSON Lines do souboru; jinak zapisuje na stdout.')
     parser.add_argument('--frames', type=int, help='Ukončit po daném počtu nových snímků.')
     parser.add_argument('--width', type=int, default=640, help='Šířka CSI snímku.')
@@ -41,6 +45,12 @@ def parse_args():
     parser.add_argument('--ev', type=float, default=None,
                         help='Kompenzace expozice CSI kamery, např. --ev -2. Výchozí 0; AWB auto.')
     args = parser.parse_args()
+    if args.red_diameter_px is not None and (not np.isfinite(args.red_diameter_px) or args.red_diameter_px <= 0 or args.detector != 'red'):
+        parser.error('--red-diameter-px musí být kladné číslo a vyžaduje --detector red.')
+    if args.tuning_file is not None and args.picamera is None:
+        parser.error('--tuning-file vyžaduje --picamera.')
+    if args.hough and args.detector == 'red':
+        parser.error('--hough je pouze pro --detector geometry.')
     if args.frames is not None and args.frames < 1:
         parser.error('--frames musí být kladné.')
     if args.baud <= 0 or (args.target_system is not None and not 1 <= args.target_system <= 255):
@@ -93,7 +103,9 @@ def main() -> int:
                 frame = camera.read()
             else:
                 device = PiCamera(args.picamera, ev=args.ev if args.ev is not None else 0.0,
-                                  width=args.width, height=args.height) if args.picamera is not None else Camera(args.camera)
+                                  width=args.width, height=args.height,
+                                  tuning_file=(None if args.tuning_file == 'none' else
+                                               args.tuning_file or ('ov5647_noir.json' if args.detector == 'red' else None))) if args.picamera is not None else Camera(args.camera)
                 camera = stack.enter_context(device)
                 frame = camera.read()
             received_at = time.time()
@@ -108,7 +120,8 @@ def main() -> int:
                 encoded.tofile(args.snapshot)
                 print(f'Snímek uložen: {args.snapshot.resolve()}')
                 return 0
-            vision = Vision()
+            vision = Vision(mode=args.detector, expected_diameter=args.red_diameter_px)
+            vision.detector.use_hough = args.hough
             vision.detector.sensitivity = args.sensitivity
             target_lock = TargetLock()
             stream = stack.enter_context(args.output.open('a', encoding='utf-8')) if args.output else sys.stdout
@@ -122,7 +135,8 @@ def main() -> int:
             if not args.headless:
                 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
                 window_created = True
-                print("Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.", file=sys.stderr)
+                print('Červené oblasti. E: maska, Q / Escape: konec.' if args.detector == 'red' else
+                      'Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.', file=sys.stderr)
             observation = None
             while True:
                 if observation is None or camera is not None:

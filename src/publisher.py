@@ -23,7 +23,9 @@ def detection_record(observation, *, sequence, received_at, source):
                          if observation.target is not None else None,
         'offset_px': {'x': measurement.x-width/2, 'y': measurement.y-height/2} if valid else None,
         'candidate_count': len(observation.circles),
+        'detector_mode': observation.detector_mode,
         'processing_ms': observation.processing_ms,
+        'stage_ms': observation.stage_ms,
         'geolocation': None,
         'geolocation_status': 'telemetry_and_calibration_not_connected',
     }

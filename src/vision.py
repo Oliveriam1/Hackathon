@@ -7,6 +7,7 @@ import time
 from .circle_detector import Circle, CircleDetector
 from .rectangle_detector import find_rectangles, enclosing_rectangle, find_faint_quadrilaterals
 from .tracker import TargetTracker
+from .red_detector import RedDetector
 
 MIN_AXIS_RATIO = 0.35  # elipsa kolečka až při ~70° od kolmého pohledu
 
@@ -22,6 +23,8 @@ class Observation:
     measured: bool = False      # False = poloha je jen predikce
     frame_size: tuple[int, int] | None = None  # (šířka, výška)
     measurement: Circle | None = None
+    stage_ms: dict | None = None
+    detector_mode: str = 'geometry'
 
     @property
     def offset(self):
@@ -33,8 +36,11 @@ class Observation:
 
 
 class Vision:
-    def __init__(self):
-        self.detector = CircleDetector()
+    def __init__(self, mode='geometry', expected_diameter=None):
+        if mode not in ('geometry', 'red'):
+            raise ValueError('Neznámý režim detekce.')
+        self.mode = mode
+        self.detector = RedDetector(expected_diameter) if mode == 'red' else CircleDetector()
         self.tracker = TargetTracker()
         self.reset()
 
@@ -45,7 +51,20 @@ class Vision:
 
     def observe(self, frame):
         started = time.perf_counter()
+        if self.mode == 'red':
+            if self.previous_shape != frame.shape:
+                self.reset()
+            self.previous_shape = frame.shape
+            candidates = self.detector.detect(frame)
+            state = self.tracker.update(candidates, lambda prediction: [])
+            elapsed = (time.perf_counter()-started)*1000
+            height, width = frame.shape[:2]
+            return Observation(candidates, f'{state.status} | red | {elapsed:.0f} ms', [],
+                               state.confirmed, elapsed, state.target, state.measured,
+                               (width, height), self.tracker.last_measurement,
+                               {'red_and_tracking': elapsed}, 'red')
         gray, edges = self.detector.prepare(frame)
+        prepared = time.perf_counter()
         if self.previous_shape != frame.shape or self.previous_sensitivity != self.detector.sensitivity:
             self.reset()
         self.previous_shape = frame.shape
@@ -53,6 +72,7 @@ class Vision:
         rectangles = find_rectangles(edges)
         if not rectangles:
             rectangles = find_faint_quadrilaterals(frame)
+        quadrilaterals_done = time.perf_counter()
         candidates = []
         for rectangle in rectangles:
             for circle in self._circles_in(gray, edges, rectangle):
@@ -61,10 +81,14 @@ class Vision:
                     continue
                 candidates.append(circle)
         state = self.tracker.update(candidates, lambda prediction: self._circles_near(gray, edges, prediction))
-        elapsed = (time.perf_counter()-started)*1000
+        finished = time.perf_counter()
+        elapsed = (finished-started)*1000
+        stages = dict(prepare=(prepared-started)*1000,
+                      quadrilaterals=(quadrilaterals_done-prepared)*1000,
+                      circles_and_tracking=(finished-quadrilaterals_done)*1000)
         height, width = frame.shape[:2]
         return Observation(candidates, f'{state.status} | {elapsed:.0f} ms', rectangles, state.confirmed,
-                           elapsed, state.target, state.measured, (width, height), self.tracker.last_measurement)
+                           elapsed, state.target, state.measured, (width, height), self.tracker.last_measurement, stages)
 
     def _circles_in(self, gray, edges, rectangle):
         x, y, width, height = cv2.boundingRect(rectangle)

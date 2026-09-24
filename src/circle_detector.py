@@ -94,8 +94,9 @@ def merge_duplicates(candidates):
 
 
 class CircleDetector:
-    def __init__(self, sensitivity=1.5, min_axis_ratio=0.92):
+    def __init__(self, sensitivity=1.5, min_axis_ratio=0.92, use_hough=False):
         self.sensitivity = sensitivity
+        self.use_hough = use_hough
         self.min_axis_ratio = min_axis_ratio
         self.edges = None
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -130,9 +131,10 @@ class CircleDetector:
                     candidates.append(circle)
         # Hough je jen záloha pro přerušené hrany. Tam, kde obrys elipsu našel,
         # by kruh opřený o okolní hrany (rám, prstenec) jen přidal chybnou polohu.
-        candidates += [circle for circle in self._hough(gray, edges, mask)
-                       if all(math.hypot(circle.x-other.x, circle.y-other.y) > circle.radius + other.radius
-                              for other in candidates)]
+        if self.use_hough:
+            candidates += [circle for circle in self._hough(gray, edges, mask)
+                           if all(math.hypot(circle.x-other.x, circle.y-other.y) > circle.radius + other.radius
+                                  for other in candidates)]
         return merge_duplicates(candidates)
 
     @staticmethod

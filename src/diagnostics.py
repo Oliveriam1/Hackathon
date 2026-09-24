@@ -28,9 +28,18 @@ class Diagnostics:
             kind = 'MERENI' if observation.measured else ('PREDIKCE' if observation.target else 'ZADNY')
             point = observation.measurement
             position = f'({point.x:.0f}, {point.y:.0f})' if point is not None else '--'
+            stage = ('BEZ_4UHELNIKU' if not observation.rectangles else
+                     'BEZ_KOLECKA_UVNITR' if not observation.circles else
+                     'VICE_KANDIDATU' if len(observation.circles) > 1 else 'KANDIDAT')
+            timings = observation.stage_ms or {}
+            detail = '/'.join(f'{timings.get(key, 0):.0f}' for key in
+                              ('prepare', 'quadrilaterals', 'circles_and_tracking'))
+            if observation.detector_mode == 'red':
+                stage = 'RED' if observation.circles else 'BEZ_CERVENE'
+                detail = f"red:{timings.get('red_and_tracking', 0):.0f}"
             print(f'FPS={fps} | detekce={observation.processing_ms:.0f} ms | '
                   f'4uhelniky={len(observation.rectangles)} | kandidati={len(observation.circles)} | '
-                  f'{kind} {position} | {lock}', file=self.stream, flush=True)
+                  f'{kind} {position} | {lock} | {stage} | faze_ms={detail}', file=self.stream, flush=True)
             self.last_report, self.count = now, 0
         if self.directory is not None and self.saved < 30 and (self.last_saved is None or now-self.last_saved >= 2):
             prefix = self.directory / f'{self.saved:03d}'

@@ -5,7 +5,7 @@ import math
 
 
 class PiCamera:
-    def __init__(self, index=0, *, ev=0.0, width=640, height=480):
+    def __init__(self, index=0, *, ev=0.0, width=640, height=480, tuning_file=None):
         if width <= 0 or height <= 0:
             raise ValueError('Rozlišení musí být kladné.')
         self.size = (width, height)
@@ -13,6 +13,7 @@ class PiCamera:
             raise ValueError('Expozice EV musí být v rozsahu -8 až 8.')
         self.index = index
         self.ev = ev
+        self.tuning_file = tuning_file
         self._camera = None
 
     def open(self):
@@ -28,11 +29,12 @@ class PiCamera:
         cameras = Picamera2.global_camera_info()
         if not 0 <= self.index < len(cameras):
             raise RuntimeError(f'CSI kamera {self.index} není dostupná. Ověřte rpicam-hello --list-cameras.')
-        camera = Picamera2(camera_num=self.index)
+        tuning = Picamera2.load_tuning_file(self.tuning_file) if self.tuning_file else None
+        camera = Picamera2(camera_num=self.index, tuning=tuning)
         try:
             # RGB888 v Picamera2 poskytuje bajty B,G,R, jak je očekává OpenCV.
-            config = camera.create_preview_configuration(
-                main={'size': self.size, 'format': 'RGB888'})
+            config = camera.create_video_configuration(
+                main={'size': self.size, 'format': 'RGB888'}, buffer_count=3)
             camera.configure(config)
             # Libcamera AwbMode Auto = 0; EV upravuje cíl automatické expozice.
             camera.set_controls({'AeEnable': True, 'ExposureValue': self.ev,
