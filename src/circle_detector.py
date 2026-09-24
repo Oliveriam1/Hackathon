@@ -16,16 +16,25 @@ class CircleDetector:
     def __init__(self, sensitivity=1.5):
         self.sensitivity = sensitivity
         self.edges = None
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-    def detect(self, frame):
+    def prepare(self, frame):
         if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3 or frame.size == 0:
             raise ValueError('Očekáván neprázdný BGR obraz uint8.')
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        gray = self._clahe.apply(gray)
         gray = cv2.GaussianBlur(gray, (5, 5), 1)
         threshold = {1: 100, 1.5: 82, 2: 65, 3: 40}[self.sensitivity]
         edges = cv2.Canny(gray, threshold / 2, threshold)
         self.edges = edges
+        return gray, edges
+
+    def detect(self, frame):
+        gray, edges = self.prepare(frame)
+        return self.detect_prepared(gray, edges)
+
+    def detect_prepared(self, gray, edges):
+        threshold = {1: 100, 1.5: 82, 2: 65, 3: 40}[self.sensitivity]
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         height, width = gray.shape
         candidates = []

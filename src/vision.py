@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import cv2
 import math
+import time
 from .circle_detector import Circle, CircleDetector
 from .rectangle_detector import find_rectangles, enclosing_rectangle
 
@@ -12,6 +13,7 @@ class Observation:
     status: str
     rectangles: list
     confirmed: bool
+    processing_ms: float
 
 
 class Vision:
@@ -26,9 +28,23 @@ class Vision:
         self.previous_sensitivity = None
 
     def observe(self, frame):
-        circles = self.detector.detect(frame)
-        rectangles = find_rectangles(self.detector.edges)
-        candidates = [circle for circle in circles if enclosing_rectangle(circle, rectangles) is not None]
+        started = time.perf_counter()
+        gray, edges = self.detector.prepare(frame)
+        rectangles = find_rectangles(edges)
+        candidates = []
+        for rectangle in rectangles:
+            x, y, width, height = cv2.boundingRect(rectangle)
+            # Předzpracování je společné. Drahé hledání kruhů jen v oblasti terče.
+            circles = self.detector.detect_prepared(gray[y:y+height, x:x+width],
+                                                    edges[y:y+height, x:x+width])
+            for local in circles:
+                circle = Circle(local.x+x, local.y+y, local.radius)
+                if enclosing_rectangle(circle, [rectangle]) is None:
+                    continue
+                if any(math.hypot(circle.x-old.x, circle.y-old.y) < max(4, old.radius*0.15)
+                       for old in candidates):
+                    continue
+                candidates.append(circle)
         if self.previous_shape != frame.shape or self.previous_sensitivity != self.detector.sensitivity:
             self.reset()
         self.previous_shape = frame.shape
@@ -46,8 +62,9 @@ class Vision:
         else:
             self.previous = None
             self.hits = 0
-            status = 'VICE KANDIDATU' if candidates else 'HLEDAM KOLECKO V OBDELNIKU'
-        return Observation(candidates, f'{status} | citlivost {self.detector.sensitivity:g}', rectangles, confirmed)
+            status = 'VICE KANDIDATU' if candidates else 'HLEDAM KOLECKO VE CTYRUHELNIKU'
+        elapsed = (time.perf_counter()-started)*1000
+        return Observation(candidates, f'{status} | {elapsed:.0f} ms', rectangles, confirmed, elapsed)
 
 
 def annotate_observation(image, observation):

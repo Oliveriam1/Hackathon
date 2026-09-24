@@ -74,7 +74,7 @@ def main() -> int:
                 background = cv2.cvtColor(vision.detector.edges, cv2.COLOR_GRAY2BGR) if show_edges else frame
                 image = annotate_observation(background, observation)
                 cv2.imshow(window_name, image)
-                key = cv2.waitKey(20) & 0xFF
+                key = cv2.waitKey(1) & 0xFF
                 if key in (ord('1'), ord('2'), ord('3')):
                     vision.detector.sensitivity = int(chr(key))
                 if key in (ord('b'), ord('B')):
