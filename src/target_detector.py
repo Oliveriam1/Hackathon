@@ -185,10 +185,19 @@ class CircleInQuadrilateralDetector:
             if perimeter <= 0:
                 continue
             circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-            if circularity < 0.58:
+            
+            # The prompt requested 0.75 to 1.2 for circularity
+            if not (0.75 <= circularity <= 1.2):
                 continue
 
-            (x, y), radius = cv2.minEnclosingCircle(contour)
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            
+            x = M["m10"] / M["m00"]
+            y = M["m01"] / M["m00"]
+            radius = math.sqrt(area / math.pi)
+
             if radius < self.min_circle_radius_px or radius > min(w, h) * 0.42:
                 continue
 
@@ -196,50 +205,11 @@ class CircleInQuadrilateralDetector:
             if x - radius <= margin or y - radius <= margin or x + radius >= w - margin or y + radius >= h - margin:
                 continue
 
-            if len(contour) >= 5:
-                (_, _), (axis_a, axis_b), _ = cv2.fitEllipse(contour)
-                major = max(axis_a, axis_b)
-                minor = min(axis_a, axis_b)
-                if major <= 0 or minor / major < 0.72:
-                    continue
-                ellipse_score = min(1.0, minor / major)
-            else:
-                ellipse_score = 0.75
-
-            fill_ratio = area / (math.pi * radius * radius)
-            if not 0.45 <= fill_ratio <= 1.20:
-                continue
-
-            score = float(
-                np.clip(
-                    0.50 * min(1.0, circularity)
-                    + 0.30 * ellipse_score
-                    + 0.20 * min(1.0, fill_ratio),
-                    0.0,
-                    1.0,
-                )
-            )
+            # We use circularity as our confidence score
+            score = float(min(1.0, circularity) if circularity <= 1.0 else 1.0 / circularity)
             candidates.append((float(x), float(y), float(radius), score))
 
         if not candidates:
-            # Hough fallback for weak/broken circular edges.
-            circles = cv2.HoughCircles(
-                work,
-                cv2.HOUGH_GRADIENT,
-                dp=1.2,
-                minDist=max(20, min(w, h) // 5),
-                param1=100,
-                param2=24,
-                minRadius=self.min_circle_radius_px,
-                maxRadius=max(self.min_circle_radius_px + 1, int(min(w, h) * 0.40)),
-            )
-            if circles is None:
-                return None
-            for x, y, radius in circles[0]:
-                margin = max(4.0, radius * 0.20)
-                if x - radius <= margin or y - radius <= margin or x + radius >= w - margin or y + radius >= h - margin:
-                    continue
-                return float(x), float(y), float(radius), 0.62
             return None
 
         return max(candidates, key=lambda item: item[3])
@@ -299,8 +269,8 @@ class CircleInQuadrilateralDetector:
         return result.targets[0].center if result.targets else None
 
 
-def annotate(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
-    """Draw only the detected quadrilateral/circle geometry for testing."""
+def annotate(frame: np.ndarray, result: DetectionResult, telemetry_lines: list[str] | None = None) -> np.ndarray:
+    """Draw only the detected quadrilateral/circle geometry and telemetry for testing."""
     if frame.ndim == 2:
         output = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     else:
@@ -311,18 +281,37 @@ def annotate(frame: np.ndarray, result: DetectionResult) -> np.ndarray:
             [[[round(point.x), round(point.y)]] for point in target.quadrilateral],
             dtype=np.int32,
         )
-        cv2.polylines(output, [quad], True, (255, 255, 255), 2)
+        # Quad green
+        cv2.polylines(output, [quad], True, (0, 255, 0), 2)
         center = (round(target.center.x), round(target.center.y))
-        cv2.circle(output, center, max(2, round(target.radius_px)), (255, 255, 255), 2)
-        cv2.drawMarker(output, center, (255, 255, 255), cv2.MARKER_CROSS, 14, 2)
+        # Circle red
+        cv2.circle(output, center, max(2, round(target.radius_px)), (0, 0, 255), 2)
+        # Center red dot
+        cv2.drawMarker(output, center, (0, 0, 255), cv2.MARKER_CROSS, 14, 2)
+        
         cv2.putText(
             output,
             f"circle ({center[0]}, {center[1]}) {target.confidence:.2f}",
             (max(0, center[0] - 90), max(18, center[1] - round(target.radius_px) - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            (255, 255, 255),
+            (0, 0, 255),
             1,
             cv2.LINE_AA,
         )
+    
+    if telemetry_lines:
+        for idx, line in enumerate(telemetry_lines):
+            y = 30 + (idx * 25)
+            cv2.putText(
+                output,
+                line,
+                (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
     return output
