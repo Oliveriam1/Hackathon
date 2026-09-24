@@ -1,11 +1,15 @@
 """CSI kamera Raspberry Pi přes systémový balíček Picamera2."""
 
 import time
+import math
 
 
 class PiCamera:
-    def __init__(self, index=0):
+    def __init__(self, index=0, *, ev=0.0):
+        if not math.isfinite(ev) or not -8 <= ev <= 8:
+            raise ValueError('Expozice EV musí být v rozsahu -8 až 8.')
         self.index = index
+        self.ev = ev
         self._camera = None
 
     def open(self):
@@ -27,6 +31,9 @@ class PiCamera:
             config = camera.create_preview_configuration(
                 main={'size': (640, 480), 'format': 'RGB888'})
             camera.configure(config)
+            # Libcamera AwbMode Auto = 0; EV upravuje cíl automatické expozice.
+            camera.set_controls({'AeEnable': True, 'ExposureValue': self.ev,
+                                 'AwbEnable': True, 'AwbMode': 0})
             camera.start()
             time.sleep(2)  # Ustálení automatické expozice před prvním snímkem.
         except BaseException:

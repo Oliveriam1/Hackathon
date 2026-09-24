@@ -25,6 +25,8 @@ def main() -> int:
     source.add_argument("--demo", action="store_true", help="Testovací obraz bez kamery.")
     source.add_argument("--picamera", type=int, metavar="INDEX", help="CSI kamera přes Picamera2, např. --picamera 0.")
     parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
+    parser.add_argument('--ev', type=float, default=None,
+                        help='Kompenzace expozice CSI kamery, např. --ev -2. Výchozí 0; AWB auto.')
     parser.add_argument('--calibration', type=Path, default=Path(__file__).with_name('color_calibration.json'),
                         help='Soubor barevné kalibrace, načítá se automaticky, S jej uloží.')
     args = parser.parse_args()
@@ -32,6 +34,10 @@ def main() -> int:
         parser.error("Index kamery musí být nezáporný.")
     if args.picamera is not None and args.picamera < 0:
         parser.error("Index CSI kamery musí být nezáporný.")
+    if args.ev is not None and args.picamera is None:
+        parser.error('--ev lze použít pouze s --picamera.')
+    if args.ev is not None and (not np.isfinite(args.ev) or not -8 <= args.ev <= 8):
+        parser.error('--ev musí být v rozsahu -8 až 8.')
 
     window_name = "Kamera - Q / Esc: konec"
     window_created = False
@@ -49,7 +55,7 @@ def main() -> int:
                 if frame is None:
                     raise RuntimeError("Soubor nelze načíst jako obrázek.")
             else:
-                device = PiCamera(args.picamera) if args.picamera is not None else Camera(args.camera)
+                device = PiCamera(args.picamera, ev=args.ev if args.ev is not None else 0.0) if args.picamera is not None else Camera(args.camera)
                 camera = stack.enter_context(device)
                 frame = camera.read()
             if args.snapshot:
