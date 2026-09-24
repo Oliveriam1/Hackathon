@@ -87,7 +87,14 @@ SEARCH_OVERLAP = 0.7    # grid spacing as a fraction of the camera footprint
 SETTLE_S = 0.5          # wait after each search move before grabbing a frame
 ROI_HALF_MIN = 120      # tracking window half-size in px
 LOST_FRAMES = 15        # frames without target before going back to SEARCH
-PRINT_EVERY_S = 0.2
+# --- lightweight contour geometry / event logging ---
+ANGLE_LOG_DELTA_DEG = 5.0
+EVENT_LOG_MIN_INTERVAL_S = 0.25
+QUAD_MIN_AREA_PX = 300
+QUAD_MAX_FRAME_FRACTION = 0.95
+CIRCLE_MIN_AREA_PX = 12
+CIRCLE_MIN_CIRCULARITY = 0.68
+CIRCLE_MAX_ASPECT_RATIO = 1.45
 # =====================================================================
 
 F_X = (CAPTURE_W / 2) / math.tan(math.radians(HFOV_DEG / 2))  # focal length in px
@@ -294,6 +301,142 @@ class SimCamera:
 
 
 # --------------------------- detection ---------------------------
+def normalize_rect_angle(rect):
+    """Return tilt in degrees relative to the nearest image axis.
+
+    OpenCV's minAreaRect angle convention differs between versions.  The
+    width/height correction below converts it to the orientation of the
+    rectangle's long side and the modulo step expresses only the deviation
+    from horizontal/vertical.  Result is in [-45, +45): negative = left
+    (counter-clockwise on screen), positive = right (clockwise on screen).
+    """
+    (_, _), (w, h), raw_angle = rect
+    if w <= 0.0 or h <= 0.0:
+        return None
+
+    angle = float(raw_angle)
+    # Typical OpenCV builds return [-90, 0); some return [0, 90).
+    # Whichever convention is used, the width/height swap maps the long side
+    # to a stable orientation before reducing it to the nearest image axis.
+    if w < h:
+        angle += 90.0
+    angle = (angle + 45.0) % 90.0 - 45.0
+
+    # In image coordinates Y points down, so positive screen rotation is a
+    # clockwise/right tilt.  The corrected long-side angle already follows
+    # that convention.
+    return angle
+
+
+def _contour_center(contour):
+    m = cv2.moments(contour)
+    if abs(m["m00"]) > 1e-6:
+        return m["m10"] / m["m00"], m["m01"] / m["m00"]
+    (x, y), _ = cv2.minEnclosingCircle(contour)
+    return float(x), float(y)
+
+
+def analyze_object_geometry(frame, prefer=None):
+    """Find the main quadrilateral and circular contours inside it.
+
+    This intentionally uses only cheap operations: grayscale conversion,
+    Canny edges, contour geometry, polygon tests and circularity.  No temporal
+    image filters or expensive model-based processing are used.
+
+    Returns a dict with: contour, angle, center, circles; or None when no
+    suitable quadrilateral is visible.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 180, apertureSize=3, L2gradient=False)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    frame_area = frame.shape[0] * frame.shape[1]
+    max_quad_area = frame_area * QUAD_MAX_FRAME_FRACTION
+    candidates = []
+
+    for contour in contours:
+        area = abs(cv2.contourArea(contour))
+        if area < QUAD_MIN_AREA_PX or area > max_quad_area:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0.0:
+            continue
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+
+        contains_preferred = False
+        if prefer is not None:
+            contains_preferred = cv2.pointPolygonTest(
+                approx, (float(prefer[0]), float(prefer[1])), False
+            ) >= 0
+        # Prefer a quadrilateral containing the currently tracked red target;
+        # otherwise fall back to the largest valid quadrilateral.
+        candidates.append((1 if contains_preferred else 0, area, approx))
+
+    if not candidates:
+        return None
+
+    _, quad_area, quad = max(candidates, key=lambda item: (item[0], item[1]))
+    rect = cv2.minAreaRect(quad)
+    tilt = normalize_rect_angle(rect)
+    quad_center = tuple(map(float, rect[0]))
+
+    circle_candidates = []
+    for contour in contours:
+        area = abs(cv2.contourArea(contour))
+        if area < CIRCLE_MIN_AREA_PX or area >= quad_area * 0.35:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0.0:
+            continue
+        circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+        if circularity < CIRCLE_MIN_CIRCULARITY:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+        aspect = max(w, h) / float(min(w, h))
+        if aspect > CIRCLE_MAX_ASPECT_RATIO:
+            continue
+
+        cx, cy = _contour_center(contour)
+        if cv2.pointPolygonTest(quad, (float(cx), float(cy)), False) < 0:
+            continue
+        circle_candidates.append((area, (cx, cy), contour))
+
+    # An edge image can produce an inner and outer contour for the same ring.
+    # Keep only one contour per visible circle by merging close centroids.
+    circle_candidates.sort(key=lambda item: item[0], reverse=True)
+    circles = []
+    for area, center, contour in circle_candidates:
+        _, radius = cv2.minEnclosingCircle(contour)
+        duplicate = False
+        for kept in circles:
+            dist = math.hypot(center[0] - kept["center"][0], center[1] - kept["center"][1])
+            if dist <= max(4.0, 0.5 * max(radius, kept["radius"])):
+                duplicate = True
+                break
+        if not duplicate:
+            circles.append({
+                "center": center,
+                "radius": float(radius),
+                "area": float(area),
+                "contour": contour,
+            })
+
+    return {
+        "contour": quad,
+        "rect": rect,
+        "angle": tilt,
+        "center": quad_center,
+        "circles": circles,
+    }
+
+
 def detect(frame, exp_px, roi=None, prefer=None):
     """Find the red blob that best matches the expected size. Returns dict or None.
     roi = (x0, y0, x1, y1) window; prefer = (x, y) favour blobs near this point."""
@@ -381,9 +524,12 @@ def run(args):
     settle_until = time.time() + SETTLE_S
     last_pos, misses, prev_err, centred = None, 0, (0.0, 0.0), 0
     estimates = deque(maxlen=60)
-    t_prev, fps, t_print = time.time(), 0.0, 0.0
+    t_prev, fps = time.time(), 0.0
     t_start = time.time()
     result = None
+    last_logged_circle_count = None
+    last_logged_angle = None
+    last_event_log_time = 0.0
 
     try:
         while True:
@@ -463,13 +609,38 @@ def run(args):
                     result = (mx, my)
                     line += f" | TARGET field=({mx:6.2f}, {my:6.2f}) m +-{sd:.2f}"
 
+            geometry = analyze_object_geometry(frame, prefer=last_pos if det is not None else None)
+            if geometry is not None:
+                visible_circles = len(geometry["circles"])
+                object_angle = geometry["angle"]
+                if geometry["circles"]:
+                    # Largest circular contour is the most stable centre to log.
+                    log_center = geometry["circles"][0]["center"]
+                else:
+                    log_center = geometry["center"]
+            else:
+                visible_circles = 0
+                object_angle = None
+                log_center = last_pos if last_pos is not None else (W / 2.0, H / 2.0)
+
+            count_changed = (last_logged_circle_count is None or
+                             visible_circles != last_logged_circle_count)
+            angle_changed = (object_angle is not None and
+                             (last_logged_angle is None or
+                              abs(object_angle - last_logged_angle) > ANGLE_LOG_DELTA_DEG))
+            if (count_changed or angle_changed) and now - last_event_log_time >= EVENT_LOG_MIN_INTERVAL_S:
+                angle_text = f"{object_angle:+.1f}" if object_angle is not None else "N/A"
+                print(f"INFO: Viditelne kruhy: {visible_circles}, "
+                      f"Stred: ({int(round(log_center[0]))}, {int(round(log_center[1]))}), "
+                      f"Naklon: {angle_text}°")
+                last_logged_circle_count = visible_circles
+                if object_angle is not None:
+                    last_logged_angle = object_angle
+                last_event_log_time = now
+
             dt, t_prev = now - t_prev, now
             if dt > 0:
                 fps = 0.9 * fps + 0.1 / dt
-            if now - t_print >= PRINT_EVERY_S:
-                print(f"{line} | {fps:4.1f} fps")
-                t_print = now
-
             if args.show:
                 view = frame.copy()
                 cv2.drawMarker(view, (W // 2, H // 2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
@@ -477,7 +648,20 @@ def run(args):
                     c = (int(det["x"]), int(det["y"]))
                     cv2.circle(view, c, max(12, int(exp_px)), (0, 255, 0), 2)
                     cv2.line(view, (W // 2, H // 2), c, (0, 255, 255), 1)
+                if geometry is not None:
+                    cv2.drawContours(view, [geometry["contour"]], -1, (255, 0, 255), 2)
+                    for circle in geometry["circles"]:
+                        cc = (int(round(circle["center"][0])), int(round(circle["center"][1])))
+                        rr = max(3, int(round(circle["radius"])))
+                        cv2.circle(view, cc, rr, (0, 255, 0), 2)
                 cv2.putText(view, state, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
+                cv2.putText(view, f"Viditelne kruhy: {visible_circles}", (20, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                tilt_text = f"{object_angle:+.1f}" if object_angle is not None else "N/A"
+                cv2.putText(view, f"Naklon objektu: {tilt_text} stupnu", (20, 125),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(view, f"FPS: {fps:.1f}", (20, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 cv2.imshow("tracker (q = quit)", cv2.resize(view, None, fx=0.5, fy=0.5))
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
