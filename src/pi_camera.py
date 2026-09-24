@@ -1,17 +1,53 @@
-"""Raspberry Pi CSI camera backend using Picamera2."""
+"""Raspberry Pi CSI camera backend using Picamera2.
+
+Picamera2 is intentionally loaded only when :meth:`PiCamera.open` is called.
+That keeps this module importable on macOS/Windows for demo/image testing even
+though Picamera2 itself is Raspberry-Pi-specific.
+"""
 
 from __future__ import annotations
 
+from importlib import import_module
 import time
+from typing import Any
 
 import numpy as np
 
 
-class PiCamera:
-    """Small Picamera2 wrapper returning NumPy frames.
+def _load_picamera2_class() -> Any:
+    """Load Picamera2 lazily and return its ``Picamera2`` class.
 
-    The target detector intentionally ignores colour and works from intensity only,
-    so the magenta/red cast of a NoIR/infrared-sensitive camera is not relevant.
+    Picamera2 is supplied by Raspberry Pi OS as the ``python3-picamera2``
+    system package. It should not be added as a normal cross-platform pip
+    dependency because it is not intended for macOS/Windows.
+    """
+    try:
+        module = import_module("picamera2")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Picamera2 is not installed or is not visible to this Python environment. "
+            "On Raspberry Pi OS run: sudo apt install python3-picamera2, then create "
+            "the virtual environment with: python3 -m venv --system-site-packages .venv"
+        ) from exc
+
+    picamera2_class = getattr(module, "Picamera2", None)
+    if picamera2_class is None:
+        raise RuntimeError(
+            "The installed 'picamera2' module does not provide Picamera2. "
+            "Reinstall Raspberry Pi OS package: sudo apt install --reinstall python3-picamera2"
+        )
+    return picamera2_class
+
+
+class PiCamera:
+    """Minimal Picamera2 wrapper that returns OpenCV-ready NumPy frames.
+
+    Flow on Raspberry Pi:
+
+        CSI camera -> Picamera2 -> NumPy ndarray -> OpenCV detector
+
+    The detector uses image intensity/geometry rather than RED/GREEN colour, so
+    the strong colour cast of a NoIR/IR-sensitive camera is not relied upon.
     """
 
     def __init__(self, index: int = 0, *, width: int = 1280, height: int = 720) -> None:
@@ -19,40 +55,52 @@ class PiCamera:
             raise ValueError("Camera index must be non-negative.")
         if width <= 0 or height <= 0:
             raise ValueError("Camera resolution must be positive.")
+
         self.index = index
         self.width = width
         self.height = height
-        self._camera = None
+        self._camera: Any | None = None
 
     def open(self) -> None:
+        """Open and start the selected Raspberry Pi CSI camera."""
         if self._camera is not None:
             return
 
+        Picamera2 = _load_picamera2_class()
+
         try:
-            from picamera2 import Picamera2
-        except ImportError as exc:
+            cameras = Picamera2.global_camera_info()
+        except Exception as exc:
             raise RuntimeError(
-                "Picamera2 is not available. On Raspberry Pi OS install "
-                "python3-picamera2 and create the venv with --system-site-packages."
+                "Picamera2 loaded, but Raspberry Pi camera information could not be read. "
+                "Check the camera connection with: rpicam-hello --list-cameras"
             ) from exc
 
-        cameras = Picamera2.global_camera_info()
-        if not 0 <= self.index < len(cameras):
+        if not cameras:
             raise RuntimeError(
-                f"CSI camera {self.index} is not available. "
+                "Picamera2 is available, but no CSI camera was detected. "
+                "Check the ribbon cable and run: rpicam-hello --list-cameras"
+            )
+        if self.index >= len(cameras):
+            raise RuntimeError(
+                f"CSI camera index {self.index} is not available; detected {len(cameras)} camera(s). "
                 "Check with: rpicam-hello --list-cameras"
             )
 
         camera = Picamera2(camera_num=self.index)
         try:
+            # RGB888 gives a normal HxWx3 uint8 NumPy array. The detector does
+            # not depend on RGB vs BGR channel order because it converts to
+            # channel-order-independent intensity before geometry processing.
             config = camera.create_video_configuration(
                 main={"size": (self.width, self.height), "format": "RGB888"},
                 buffer_count=4,
             )
             camera.configure(config)
-            camera.set_controls({"AeEnable": True, "AwbEnable": True})
             camera.start()
-            # Let exposure settle before the first frame.
+
+            # Give auto-exposure/auto-white-balance a short moment to settle.
+            # No colour classification is performed afterwards.
             time.sleep(1.5)
         except BaseException:
             camera.close()
@@ -61,16 +109,30 @@ class PiCamera:
         self._camera = camera
 
     def read(self) -> np.ndarray:
+        """Capture one frame as an HxWx3 uint8 NumPy array."""
         if self._camera is None:
-            raise RuntimeError("Camera is not open.")
+            raise RuntimeError("Camera is not open. Call open() first.")
+
         frame = self._camera.capture_array("main")
-        if frame is None or frame.size == 0:
-            raise RuntimeError("Camera returned an empty frame.")
+        if frame is None:
+            raise RuntimeError("Picamera2 returned no frame.")
+
+        frame = np.asarray(frame)
+        if frame.size == 0:
+            raise RuntimeError("Picamera2 returned an empty frame.")
+        if frame.ndim != 3 or frame.shape[2] < 3:
+            raise RuntimeError(f"Unexpected Picamera2 frame shape: {frame.shape!r}")
+
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
         return frame
 
     def close(self) -> None:
+        """Stop and release the CSI camera."""
         if self._camera is None:
             return
+
         camera, self._camera = self._camera, None
         try:
             camera.stop()

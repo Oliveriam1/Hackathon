@@ -14,6 +14,11 @@ source .venv/bin/activate
 pip install -r requirements-pi.txt
 ```
 
+`Picamera2` is intentionally **not** installed with `pip`. It comes from the Raspberry Pi OS
+package `python3-picamera2`. The `--system-site-packages` option lets the project virtual
+environment see that system package. On macOS/Windows, Picamera2 is not imported unless the
+real Raspberry Pi camera backend is actually opened, so `--demo` and `--image` still work.
+
 Check the camera first:
 
 ```bash
