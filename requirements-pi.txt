@@ -1,4 +1,2 @@
-numpy
-scipy
-pillow
-pyserial
+# NumPy, OpenCV and Picamera2 are supplied by Raspberry Pi OS apt packages.
+# No additional pip dependencies are currently required.

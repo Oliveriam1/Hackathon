@@ -1,0 +1,17 @@
+{
+  "description": "UNCONFIGURED: replace nulls with measured calibration and mount; no assumed FOV.",
+  "intrinsics": {
+    "fx": null,
+    "fy": null,
+    "cx": null,
+    "cy": null,
+    "width": null,
+    "height": null,
+    "distortion_coefficients": null
+  },
+  "mount": {
+    "roll_deg": null,
+    "pitch_deg": null,
+    "yaw_deg": null
+  }
+}

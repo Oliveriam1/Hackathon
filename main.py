@@ -1,4 +1,4 @@
-"""Command-line entry point for the UAV vision application."""
+"""Legacy Vision launcher; new programs have their own independent entry points."""
 
 import argparse
 import logging
@@ -16,6 +16,12 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Run without connecting to UAV or Raspberry Pi hardware.",
+    )
+    parser.add_argument("--camera", action="store_true", help="Open the local camera preview.")
+    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument(
+        "--test-pink", action="store_true",
+        help="Temporarily include pink detection in the --camera preview.",
     )
     return parser.parse_args()
 
@@ -35,14 +41,24 @@ def main() -> int:
 
     try:
         logger.info("UAV Vision starting")
+        logger.info("New entry points: vision_main.py, navigation_main.py, geolocation_main.py")
 
         import src
 
         logger.info("Version: %s", src.__version__)
         logger.info("Mode: %s", "dry-run" if args.dry_run else "normal")
         logger.info("Initialization complete")
+        if args.camera and args.dry_run:
+            logger.info("Dry-run: camera access skipped")
+        elif args.camera:
+            from src.camera import run_camera_preview
+
+            run_camera_preview(args.camera_index, test_pink=args.test_pink)
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+        return 0
     except Exception:
-        logger.exception("Application initialization failed")
+        logger.exception("Application failed")
         return 1
 
     return 0

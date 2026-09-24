@@ -16,13 +16,17 @@ UPPER_RED_1 = (10, 255, 255)
 LOWER_RED_2 = (170, 100, 80)
 UPPER_RED_2 = (179, 255, 255)
 
+# Temporary pink test range; separate from the production red thresholds.
+LOWER_PINK_TEST = (140, 50, 80)
+UPPER_PINK_TEST = (169, 255, 255)
+
 MIN_CONTOUR_AREA = 100.0
 MORPH_KERNEL_SIZE = 5
 CENTERING_TOLERANCE_PX = 10
 
 
 class ColorDetector:
-    """Detect the largest green reference and all sufficiently large red objects."""
+    """Detect a green reference and red candidates; color alone confirms no target."""
 
     def __init__(
         self,
@@ -63,12 +67,19 @@ class ColorDetector:
         return detections[0] if detections else None
 
     def detect_red(self, frame: np.ndarray) -> list[ColorDetection]:
-        """Return red regions from both hue ranges, sorted by decreasing area."""
+        """Return red candidates by area, including possible red boundary tape."""
         self._validate_frame(frame)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
         mask2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
         return self._detect_regions(mask1 | mask2)
+
+    def detect_pink_test(self, frame: np.ndarray) -> list[ColorDetection]:
+        """Temporary pink detection per frame; no persistent object identities."""
+        self._validate_frame(frame)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, LOWER_PINK_TEST, UPPER_PINK_TEST)
+        return self._detect_regions(mask)
 
     def _detect_regions(self, mask: np.ndarray) -> list[ColorDetection]:
         """Clean a binary mask and extract external contour centroids."""
