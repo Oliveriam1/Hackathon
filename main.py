@@ -44,7 +44,18 @@ def parse_args():
     parser.add_argument('--target-system', type=int, help='Očekávané MAVLink system ID autopilota.')
     parser.add_argument('--ev', type=float, default=None,
                         help='Kompenzace expozice CSI kamery, např. --ev -2. Jinak výchozí nastavení profilu.')
+    parser.add_argument('--servo', action='store_true',
+                        help='Serva závěsu přes pigpio (BCM 18 a 13) jako red_tracker.py; najedou do 0/0.')
+    parser.add_argument('--jako-red-tracker', action='store_true',
+                        help='Vše jako red_tracker.py: CSI 1296x972, profil ov5647_noir.json, serva --servo.')
     args = parser.parse_args()
+    if args.jako_red_tracker:
+        if args.image or args.video or args.demo:
+            parser.error('--jako-red-tracker vyžaduje CSI kameru.')
+        args.picamera = 0 if args.picamera is None else args.picamera
+        args.width, args.height = 1296, 972  # plné zorné pole OV5647, binning 2x2
+        args.tuning_file = args.tuning_file or 'ov5647_noir.json'
+        args.servo = True
     if args.red_diameter_px is not None and (not np.isfinite(args.red_diameter_px) or args.red_diameter_px <= 0 or args.detector != 'red'):
         parser.error('--red-diameter-px musí být kladné číslo a vyžaduje --detector red.')
     if args.tuning_file is not None and args.picamera is None:
@@ -86,6 +97,10 @@ def main() -> int:
             if args.mavlink:
                 from src.telemetry import MAVLinkTelemetry
                 telemetry = stack.enter_context(MAVLinkTelemetry(args.mavlink, args.baud, args.target_system))
+            if args.servo:
+                # red_tracker.py zapíná serva před kamerou.
+                from src.gimbal import Gimbal
+                stack.enter_context(Gimbal())
             camera = None
             if args.demo:
                 frame = np.full((480, 640, 3), 35, dtype=np.uint8)
