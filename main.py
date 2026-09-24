@@ -15,6 +15,7 @@ from src.pi_camera import PiCamera
 from src.vision import Vision, annotate_observation
 from src.publisher import JSONPublisher, detection_record
 from src.target_lock import TargetLock
+from src.diagnostics import Diagnostics
 
 
 def parse_args():
@@ -27,6 +28,9 @@ def parse_args():
     source.add_argument("--picamera", type=int, metavar="INDEX", help="CSI kamera přes Picamera2, např. --picamera 0.")
     parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
     parser.add_argument('--headless', action='store_true', help='Jen data, bez grafického okna; ukončení Ctrl+C.')
+    parser.add_argument('--status', action='store_true', help='Čitelný stav 1x za sekundu místo JSON v terminálu.')
+    parser.add_argument('--diagnostics', type=Path, help='Uloží nejvýše 30 dvojic raw/marked snímků, každé 2 s.')
+    parser.add_argument('--sensitivity', type=float, choices=(1, 1.5, 2, 3), default=1.5)
     parser.add_argument('--output', type=Path, help='Připojuje JSON Lines do souboru; jinak zapisuje na stdout.')
     parser.add_argument('--frames', type=int, help='Ukončit po daném počtu nových snímků.')
     parser.add_argument('--width', type=int, default=640, help='Šířka CSI snímku.')
@@ -47,7 +51,7 @@ def parse_args():
         parser.error('Rozlišení musí být kladné.')
     if args.output and any(path and path.resolve() == args.output.resolve() for path in (args.image, args.video)):
         parser.error('Výstupní data nesmí přepisovat vstupní obraz/video.')
-    if args.snapshot and (args.output or args.headless or args.frames):
+    if args.snapshot and (args.output or args.headless or args.frames or args.status or args.diagnostics):
         parser.error('--snapshot je samostatný režim fotografie; pro data použijte --headless.')
     if args.camera < 0:
         parser.error("Index kamery musí být nezáporný.")
@@ -105,9 +109,13 @@ def main() -> int:
                 print(f'Snímek uložen: {args.snapshot.resolve()}')
                 return 0
             vision = Vision()
+            vision.detector.sensitivity = args.sensitivity
             target_lock = TargetLock()
             stream = stack.enter_context(args.output.open('a', encoding='utf-8')) if args.output else sys.stdout
-            publisher = JSONPublisher(stream)
+            publisher = JSONPublisher(stream) if args.output or not args.status else None
+            diagnostics = Diagnostics(stream=sys.stdout if args.status else None, directory=args.diagnostics)
+            if diagnostics.directory is not None:
+                print(f'Diagnostika: {diagnostics.directory}', file=sys.stderr)
             source_name = 'static' if camera is None else ('video' if args.video else 'camera')
             sequence = 0
             show_edges = False
@@ -128,7 +136,9 @@ def main() -> int:
                     record['autonomy'] = {'enabled': False, 'state': 'NOT_IMPLEMENTED',
                                           'missing': ['flight_adapter', 'zone_boundary', 'gimbal_feedback',
                                                       'exposure_telemetry_synchronization']}
-                    publisher.publish(record)
+                    if publisher is not None:
+                        publisher.publish(record)
+                    diagnostics.update(frame, observation, record)
                 if args.frames is not None and sequence >= args.frames:
                     break
                 if args.headless:
