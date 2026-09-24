@@ -2,8 +2,8 @@
 import cv2
 import numpy as np
 
-MIN_AREA = 500
-MIN_SIDE = 12
+MIN_AREA = 200
+MIN_SIDE = 8
 _CLOSE_KERNEL = np.ones((3, 3), np.uint8)
 
 

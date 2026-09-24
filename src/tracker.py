@@ -35,6 +35,7 @@ class TargetTracker:
         self.missed = 0
         self.circle_only = 0
         self.confirmed = False
+        self.last_measurement = None
 
     @property
     def predicted(self):
@@ -63,6 +64,7 @@ class TargetTracker:
 
     def update(self, candidates, search_near=None):
         """candidates: kolečka v obdélníku; search_near(predikce) -> samotná kolečka."""
+        self.last_measurement = None
         if self.track is None:
             return self._start(candidates)
         match = self._match(candidates, 1.6)
@@ -73,6 +75,7 @@ class TargetTracker:
         if match is None:
             return self._miss(candidates)
         self._correct(match)
+        self.last_measurement = match
         self.hits += not circle_only
         self.missed = 0
         self.circle_only = self.circle_only + 1 if circle_only else 0
@@ -86,6 +89,7 @@ class TargetTracker:
         if len(candidates) != 1:
             return TrackState(None, False, False, 'VICE KANDIDATU' if candidates else 'HLEDAM KOLECKO VE CTYRUHELNIKU')
         self.track, self.hits = candidates[0], 1
+        self.last_measurement = candidates[0]
         return TrackState(None, False, True, f'KANDIDAT 1/{CONFIRM_HITS}')
 
     def _correct(self, circle):

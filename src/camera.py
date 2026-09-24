@@ -29,6 +29,11 @@ class Camera:
             raise RuntimeError("Kamera není otevřená.")
         success, frame = self._capture.read()
         if not success or frame is None or frame.size == 0:
+            if isinstance(self.index, str):
+                count = self._capture.get(cv2.CAP_PROP_FRAME_COUNT)
+                position = self._capture.get(cv2.CAP_PROP_POS_FRAMES)
+                if count > 0 and position >= count:
+                    raise EOFError('Konec videozáznamu.')
             raise RuntimeError("Nepodařilo se načíst snímek. Zkontrolujte připojení kamery.")
         return frame
 

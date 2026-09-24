@@ -1,8 +1,9 @@
-"""Živý náhled kamery. Ukončení klávesou Q, Escape nebo zavřením okna."""
+"""Detekce terče: JSON Lines a volitelný diagnostický náhled. Ctrl+C ukončí sběr."""
 
 import argparse
 import sys
 import os
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -12,9 +13,10 @@ import numpy as np
 from src.camera import Camera
 from src.pi_camera import PiCamera
 from src.vision import Vision, annotate_observation
+from src.publisher import JSONPublisher, detection_record
 
 
-def main() -> int:
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--camera", type=int, default=0, help="Index kamery (výchozí: 0).")
@@ -23,9 +25,22 @@ def main() -> int:
     source.add_argument("--demo", action="store_true", help="Testovací obraz bez kamery.")
     source.add_argument("--picamera", type=int, metavar="INDEX", help="CSI kamera přes Picamera2, např. --picamera 0.")
     parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
+    parser.add_argument('--headless', action='store_true', help='Jen data, bez grafického okna; ukončení Ctrl+C.')
+    parser.add_argument('--output', type=Path, help='Připojuje JSON Lines do souboru; jinak zapisuje na stdout.')
+    parser.add_argument('--frames', type=int, help='Ukončit po daném počtu nových snímků.')
+    parser.add_argument('--width', type=int, default=640, help='Šířka CSI snímku.')
+    parser.add_argument('--height', type=int, default=480, help='Výška CSI snímku.')
     parser.add_argument('--ev', type=float, default=None,
                         help='Kompenzace expozice CSI kamery, např. --ev -2. Výchozí 0; AWB auto.')
     args = parser.parse_args()
+    if args.frames is not None and args.frames < 1:
+        parser.error('--frames musí být kladné.')
+    if args.width < 1 or args.height < 1:
+        parser.error('Rozlišení musí být kladné.')
+    if args.output and any(path and path.resolve() == args.output.resolve() for path in (args.image, args.video)):
+        parser.error('Výstupní data nesmí přepisovat vstupní obraz/video.')
+    if args.snapshot and (args.output or args.headless or args.frames):
+        parser.error('--snapshot je samostatný režim fotografie; pro data použijte --headless.')
     if args.camera < 0:
         parser.error("Index kamery musí být nezáporný.")
     if args.picamera is not None and args.picamera < 0:
@@ -34,11 +49,15 @@ def main() -> int:
         parser.error('--ev lze použít pouze s --picamera.')
     if args.ev is not None and (not np.isfinite(args.ev) or not -8 <= args.ev <= 8):
         parser.error('--ev musí být v rozsahu -8 až 8.')
+    return args
 
+
+def main() -> int:
+    args = parse_args()
     window_name = "Kamera - Q / Esc: konec"
     window_created = False
     try:
-        if not args.snapshot and sys.platform.startswith('linux') and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        if not args.snapshot and not args.headless and sys.platform.startswith('linux') and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
             raise RuntimeError('Není dostupná grafická plocha. Přes SSH použijte --snapshot test.jpg.')
         with ExitStack() as stack:
             camera = None
@@ -57,9 +76,11 @@ def main() -> int:
                 camera = stack.enter_context(Camera(str(args.video)))
                 frame = camera.read()
             else:
-                device = PiCamera(args.picamera, ev=args.ev if args.ev is not None else 0.0) if args.picamera is not None else Camera(args.camera)
+                device = PiCamera(args.picamera, ev=args.ev if args.ev is not None else 0.0,
+                                  width=args.width, height=args.height) if args.picamera is not None else Camera(args.camera)
                 camera = stack.enter_context(device)
                 frame = camera.read()
+            received_at = time.time()
             if args.snapshot:
                 extension = args.snapshot.suffix.lower()
                 if extension not in ('.jpg', '.jpeg', '.png'):
@@ -71,12 +92,33 @@ def main() -> int:
                 print(f'Snímek uložen: {args.snapshot.resolve()}')
                 return 0
             vision = Vision()
+            stream = stack.enter_context(args.output.open('a', encoding='utf-8')) if args.output else sys.stdout
+            publisher = JSONPublisher(stream)
+            source_name = 'static' if camera is None else ('video' if args.video else 'camera')
+            sequence = 0
             show_edges = False
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            window_created = True
-            print("Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.")
+            if not args.headless:
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                window_created = True
+                print("Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.", file=sys.stderr)
+            observation = None
             while True:
-                observation = vision.observe(frame)
+                if observation is None or camera is not None:
+                    observation = vision.observe(frame)
+                    sequence += 1
+                    publisher.publish(detection_record(observation, sequence=sequence,
+                                                       received_at=received_at, source=source_name))
+                if args.frames is not None and sequence >= args.frames:
+                    break
+                if args.headless:
+                    if camera is None:
+                        break  # Statický obrázek není několik nezávislých měření.
+                    try:
+                        frame = camera.read()
+                    except EOFError:
+                        break
+                    received_at = time.time()
+                    continue
                 background = cv2.cvtColor(vision.detector.edges, cv2.COLOR_GRAY2BGR) if show_edges else frame
                 image = annotate_observation(background, observation)
                 cv2.imshow(window_name, image)
@@ -85,6 +127,9 @@ def main() -> int:
                     vision.detector.sensitivity = int(chr(key))
                 if key in (ord('b'), ord('B')):
                     vision.detector.sensitivity = 1.5
+                if camera is None and key in (ord('1'), ord('2'), ord('3'), ord('b'), ord('B')):
+                    vision.reset()
+                    observation = None
                 if key in (ord('e'), ord('E')):
                     show_edges = not show_edges
                 if key in (ord("q"), ord("Q"), 27):
@@ -94,9 +139,8 @@ def main() -> int:
                 if camera is not None:
                     try:
                         frame = camera.read()
-                    except RuntimeError:
-                        if args.video is None:
-                            raise
+                        received_at = time.time()
+                    except EOFError:
                         break  # konec záznamu
     except KeyboardInterrupt:
         pass

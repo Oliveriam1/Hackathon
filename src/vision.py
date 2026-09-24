@@ -1,5 +1,5 @@
 """Kolečko uvnitř čtyřúhelníku, bez barevné reference a letových povelů."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import cv2
 import math
 import numpy as np
@@ -21,6 +21,7 @@ class Observation:
     target: Circle | None = None   # vyhlazená poloha potvrzeného cíle
     measured: bool = False      # False = poloha je jen predikce
     frame_size: tuple[int, int] | None = None  # (šířka, výška)
+    measurement: Circle | None = None
 
     @property
     def offset(self):
@@ -63,19 +64,28 @@ class Vision:
         elapsed = (time.perf_counter()-started)*1000
         height, width = frame.shape[:2]
         return Observation(candidates, f'{state.status} | {elapsed:.0f} ms', rectangles, state.confirmed,
-                           elapsed, state.target, state.measured, (width, height))
+                           elapsed, state.target, state.measured, (width, height), self.tracker.last_measurement)
 
     def _circles_in(self, gray, edges, rectangle):
         x, y, width, height = cv2.boundingRect(rectangle)
         mask = np.zeros((height, width), np.uint8)
         cv2.fillPoly(mask, [(rectangle - (x, y)).astype(np.int32)], 255)
         # Rezerva: okraj obdélníku ani kolečko, které se ho dotýká, nepatří dovnitř.
-        mask = cv2.erode(mask, np.ones((5, 5), np.uint8))
+        small = min(width, height) < 80
+        mask = cv2.erode(mask, np.ones((3, 3) if small else (5, 5), np.uint8))
         # Předzpracování je společné. Drahé hledání kruhů jen v oblasti terče.
-        circles = self.detector.detect_prepared(gray[y:y+height, x:x+width], edges[y:y+height, x:x+width],
-                                                mask, MIN_AXIS_RATIO)
+        local_gray = gray[y:y+height, x:x+width]
+        local_edges = edges[y:y+height, x:x+width]
+        if small:
+            local_gray = cv2.resize(local_gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            local_edges = cv2.Canny(local_gray, 25, 65)
+            mask = cv2.resize(mask, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+        circles = self.detector.detect_prepared(local_gray, local_edges, mask, MIN_AXIS_RATIO)
+        if small:
+            circles = [replace(c, x=(c.x+0.5)/2-0.5, y=(c.y+0.5)/2-0.5,
+                               radius=c.radius/2, minor=c.minor_radius/2) for c in circles]
         return [circle.shifted(x, y) for circle in circles
-                if enclosing_rectangle(circle.shifted(x, y), [rectangle]) is not None]
+                if enclosing_rectangle(circle.shifted(x, y), [rectangle], margin=1 if small else 2) is not None]
 
     def _circles_near(self, gray, edges, prediction):
         """Samotná kolečka kolem predikce; smí jen udržet již potvrzený cíl."""
