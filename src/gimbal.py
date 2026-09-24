@@ -13,6 +13,54 @@ X_LIMITS = (-60.0, 60.0)
 Y_LIMITS = (-45.0, 45.0)
 
 
+class _Lgpio:
+    """Náhrada pigpio přes lgpio (výchozí v Raspberry Pi OS Bookworm, i Pi 5)."""
+
+    def __init__(self, lgpio):
+        self.lgpio = lgpio
+        for chip in (0, 4):  # Pi 5 se starším jádrem má piny na gpiochip4
+            try:
+                self.handle = lgpio.gpiochip_open(chip)
+                break
+            except lgpio.error:
+                continue
+        else:
+            raise RuntimeError('lgpio: nelze otevřít gpiochip0 ani gpiochip4')
+        for pin in (X_PIN, Y_PIN):
+            lgpio.gpio_claim_output(self.handle, pin)
+
+    def set_servo_pulsewidth(self, pin, width):
+        self.lgpio.tx_servo(self.handle, pin, width)  # 50 Hz; 0 = bez signálu
+
+    def stop(self):
+        self.lgpio.gpiochip_close(self.handle)
+
+
+def _connect():
+    """pigpio (hardwarově časované pulzy, jako red_tracker.py), jinak lgpio."""
+    import sys
+    problems = []
+    try:
+        import pigpio
+        pi = pigpio.pi()
+        if pi.connected:
+            return pi
+        problems.append('pigpio: démon pigpiod neběží (sudo systemctl enable --now pigpiod)')
+    except ImportError as error:
+        problems.append(f'pigpio: {error}')
+    try:
+        import lgpio
+        return _Lgpio(lgpio)
+    except ImportError as error:
+        problems.append(f'lgpio: {error}')
+    except Exception as error:
+        problems.append(f'lgpio: {error}')
+    raise RuntimeError(
+        f'Serva nelze ovládat ({sys.executable}). ' + '; '.join(problems) +
+        '. Instalace: sudo apt install python3-lgpio (nebo pigpio python3-pigpio); '
+        've venv použijte python3 -m venv --system-site-packages.')
+
+
 class Gimbal:
     """Úhly x, y jsou fyzické (stupně). Při otevření najede do 0/0."""
 
@@ -22,14 +70,7 @@ class Gimbal:
 
     def open(self):
         if self.pi is None:
-            try:
-                import pigpio
-            except ImportError as error:
-                raise RuntimeError('pigpio není dostupné: sudo apt install pigpio python3-pigpio') from error
-            self.pi = pigpio.pi()
-            if not self.pi.connected:
-                self.pi = None
-                raise RuntimeError('pigpiod neběží: sudo systemctl start pigpiod')
+            self.pi = _connect()
         self.move_to(0.0, 0.0)
 
     def pulses(self):
