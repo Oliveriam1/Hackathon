@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument('--baud', type=int, default=115200, help='Rychlost sériového MAVLink spojení.')
     parser.add_argument('--target-system', type=int, help='Očekávané MAVLink system ID autopilota.')
     parser.add_argument('--ev', type=float, default=None,
-                        help='Kompenzace expozice CSI kamery, např. --ev -2. Výchozí 0; AWB auto.')
+                        help='Kompenzace expozice CSI kamery, např. --ev -2. Jinak výchozí nastavení profilu.')
     args = parser.parse_args()
     if args.red_diameter_px is not None and (not np.isfinite(args.red_diameter_px) or args.red_diameter_px <= 0 or args.detector != 'red'):
         parser.error('--red-diameter-px musí být kladné číslo a vyžaduje --detector red.')
@@ -102,7 +102,7 @@ def main() -> int:
                 camera = stack.enter_context(Camera(str(args.video)))
                 frame = camera.read()
             else:
-                device = PiCamera(args.picamera, ev=args.ev if args.ev is not None else 0.0,
+                device = PiCamera(args.picamera, ev=args.ev,
                                   width=args.width, height=args.height,
                                   tuning_file=(None if args.tuning_file == 'none' else
                                                args.tuning_file or ('ov5647_noir.json' if args.detector == 'red' else None))) if args.picamera is not None else Camera(args.camera)

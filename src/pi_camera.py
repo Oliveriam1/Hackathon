@@ -5,11 +5,11 @@ import math
 
 
 class PiCamera:
-    def __init__(self, index=0, *, ev=0.0, width=640, height=480, tuning_file=None):
+    def __init__(self, index=0, *, ev=None, width=640, height=480, tuning_file=None):
         if width <= 0 or height <= 0:
             raise ValueError('Rozlišení musí být kladné.')
         self.size = (width, height)
-        if not math.isfinite(ev) or not -8 <= ev <= 8:
+        if ev is not None and (not math.isfinite(ev) or not -8 <= ev <= 8):
             raise ValueError('Expozice EV musí být v rozsahu -8 až 8.')
         self.index = index
         self.ev = ev
@@ -36,9 +36,10 @@ class PiCamera:
             config = camera.create_video_configuration(
                 main={'size': self.size, 'format': 'RGB888'}, buffer_count=3)
             camera.configure(config)
-            # Libcamera AwbMode Auto = 0; EV upravuje cíl automatické expozice.
-            camera.set_controls({'AeEnable': True, 'ExposureValue': self.ev,
-                                 'AwbEnable': True, 'AwbMode': 0})
+            # Stejně jako red_tracker.py ponecháme výchozí řízení z profilu.
+            # Expozici měníme pouze při explicitním --ev.
+            if self.ev is not None:
+                camera.set_controls({'AeEnable': True, 'ExposureValue': self.ev})
             camera.start()
             time.sleep(2)  # Ustálení automatické expozice před prvním snímkem.
         except BaseException:
