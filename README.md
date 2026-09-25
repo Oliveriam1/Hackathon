@@ -99,7 +99,7 @@ expozice; u videa nejde o původní čas natáčení. Číslování začíná p�
 `geolocation=null`: main zatím nemá připojenou telemetrii ani kalibraci pro výpočet
 zeměpisných souřadnic. JSON není automaticky posílán na notebook přes síť.
 
-Pro malé terče se analyzuje dvakrát zvětšený výřez (kratší strana pod 80 px),
+V režimu `geometry` se pro malé terče analyzuje dvakrát zvětšený výřez (kratší strana pod 80 px),
 nikoli celý zvětšený obraz. Souřadnice se převádějí zpět do původního rozlišení.
 Minimální plocha čtyřúhelníku je 200 px² a strana 8 px. Vyšší rozlišení může
 zlepšit dosah za cenu času zpracování; zvětšení samo neobnoví chybějící detaily.
@@ -110,39 +110,49 @@ Tok programu: `parse_args` → kamera/obraz → `Vision.observe` → `detection_
 Režim `--snapshot` zůstává samostatným uložením surové fotografie bez detekčních dat.
 Testy této větve: `python -m unittest discover -s tests -v`.
 
-## Červené tečky podle red_tracker.py
-
-Spuštění na CSI OV5647 NoIR se stejným rozlišením a profilem jako v dodaném skriptu:
+## Červené tečky a tracking
 
 ```bash
-python main.py --picamera 0 --detector red --width 1296 --height 972 --headless --status
+python3 main.py --picamera 0 --detector red --width 1296 --height 972 --status
 ```
 
-Pro JSON vynechte `--status`. Pro náhled vynechte `--headless`; E zobrazí červenou masku.
-Režim red automaticky načítá `ov5647_noir.json`. Tento profil upravuje zpracování barev,
-nevypíná IR LED. `--tuning-file none` použije systémový profil, jinak lze zadat vlastní soubor.
-Chyba načtení profilu se hlásí, nepřepíná se potichu na jinou kameru.
+Výchozí režim je `red`. Bez `--status` vypisuje plný JSON; `--headless` vypne okno.
+Klávesa E přepíná masku. Profil `ov5647_noir.json` nevypíná IR LED.
+Nastavení CSI kamery zůstává zachované. `--tuning-file none` použije systémový profil.
 
-Detektor přebírá rozdíl R-max(G,B)>25, R>50, relativní převahu červené >0.35,
-uzavření masky 3x3 a vážený střed komponenty. Nevyžaduje okolní čtyřúhelník.
-Jde o detekci červených oblastí, nikoliv záruku kruhového tvaru: červený čtverec může také projít.
-Vrací všechny kandidáty; více kandidátů brání počátečnímu potvrzení cíle.
-Volitelně `--red-diameter-px 10` filtruje velikost na 0.4 až 2.5 násobek zadaného průměru.
-Bez tohoto parametru je filtr velikosti vypnutý, protože nemáme ověřenou výšku a geometrii.
-Průměr je v pixelech aktuálního rozlišení. `--sensitivity` a `--hough` patří geometrické detekci.
+Červená i růžová procházejí společným ověřením velikosti, tvaru a místního kontrastu.
+Větší tečky musí mít eliptický obrys; u několika pixelů nelze tvar spolehlivě určit.
+Detektor vrací všechny kandidáty. Červený tracker používá čas, predikci a adaptivní
+výřez; podobně pravděpodobné cíle hlásí jako `AMBIGUOUS` bez nového platného měření.
+Geometrická detekce celého terče zůstává dostupná přes `--detector geometry`.
 
-Původní režim zůstává dostupný jako `--detector geometry` (výchozí).
-Houghova záloha je nově volitelná přes `--hough`; výchozí geometrická detekce používá obrysy a Otsu.
-Status obsahuje časy fází v ms (předzpracování/čtyřúhelníky/kolečka a tracking),
-v červeném režimu jeden čas `red`. JSON obsahuje `detector_mode` a `stage_ms`.
+`--red-diameter-px 13` je tvrdý filtr velikosti pro obě barvy.
+`--altitude`, případně čerstvá relativní výška z telemetrie, jen upravuje skóre.
+Bez výšky je měřítko neznámé; není dosazena výška 20 m.
+Konfigurovat lze také `--target-diameter-m`, `--hfov-deg` a `--camera-calibration`.
+`--geometry-debug` zapne doplňkovou geometrii okolí kandidáta.
 
-Z dodaného skriptu se nepřebírá pevná výška 20 m, poloha dronu, rozměry pole ani GPIO serv.
-Stávající výstupy měření, predikce a visual_lock zůstávají; geolokace není dostupná
-bez skutečných vstupů. Tato integrace neposílá letové ani servo povely.
+## Data pro řídicí část
+
+Náhled kamery a současně pouze datový kontrakt pro budoucí řízení:
+
+```bash
+python3 main.py --picamera 0 --detector red --width 1296 --height 972 --drone-data
+```
+
+Přidáním `--headless` zůstanou jen data. `--drone-data` nekombinujte s `--status`.
+`--output drone.jsonl` zapíše stejná data do souboru místo terminálu.
+JSON obsahuje platnost/stáří měření, stav, identitu, pixelovou polohu a normalizovanou
+odchylku v souřadnicích obrazu. Neplatná, stará či nejednoznačná měření mají cílovou
+polohu `null`. Plný běžný JSON obsahuje tento kontrakt v položce `drone_data`.
+
+`flight_ready=false`, `flight_command=null`, `world_position=null`: datový výpis
+zatím neodesílá letové povely ani neposkytuje polohu cíle na zemi.
+Podrobnosti a opakovatelné testování: [DETECTION.md](DETECTION.md).
 
 ## Struktura po fázi 1
 
 Rozdělení komponent a rozhraní dalších fází popisuje [ARCHITECTURE.md](ARCHITECTURE.md).
 `main.py` nyní pouze načte konfiguraci a spustí aplikaci; stejné příkazy fungují dál.
-Detekce a nastavení kamery zůstávají beze změny. Letová mise a automatické
+Následné změny detekce popisuje DETECTION.md; nastavení kamery zůstává zachované. Letová mise a automatické
 sledování servy zatím implementované nejsou.

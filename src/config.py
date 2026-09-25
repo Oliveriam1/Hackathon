@@ -45,6 +45,7 @@ class AppConfig:
     snapshot: Path | None = None
     headless: bool = False
     status: bool = False
+    drone_data: bool = False
     diagnostics: Path | None = None
     record_dir: Path | None = None
     sensitivity: float = 1.5
@@ -85,6 +86,7 @@ def parse_args(argv=None) -> AppConfig:
     parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
     parser.add_argument('--headless', action='store_true', help='Jen data, bez grafického okna; ukončení Ctrl+C.')
     parser.add_argument('--status', action='store_true', help='Čitelný stav 1x za sekundu místo JSON v terminálu.')
+    parser.add_argument('--drone-data', action='store_true', help='Pouze JSON kontrakt vizuálních dat pro řídicí část, bez odesílání povelů.')
     parser.add_argument('--diagnostics', type=Path, help='Uloží nejvýše 30 dvojic raw/marked snímků, každé 2 s.')
     parser.add_argument('--record-dir', type=Path, help='Uloží každý zpracovaný snímek a čas pro offline vyhodnocení; délku omezte --frames.')
     parser.add_argument('--sensitivity', type=float, choices=(1, 1.5, 2, 3), default=1.5)
@@ -121,6 +123,8 @@ def parse_args(argv=None) -> AppConfig:
     parser.add_argument('--jako-red-tracker', action='store_true',
                         help='Vše jako red_tracker.py: CSI 1296x972, profil ov5647_noir.json, serva --servo.')
     args = parser.parse_args(argv)
+    if args.drone_data and (args.status or args.snapshot):
+        parser.error('--drone-data nelze kombinovat s --status ani --snapshot.')
     if args.jako_red_tracker:
         if args.image or args.video or args.demo:
             parser.error('--jako-red-tracker vyžaduje CSI kameru.')

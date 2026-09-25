@@ -4,6 +4,7 @@ from .vision import Vision
 from .target_lock import TargetLock
 from .publisher import detection_record
 from .mission import Mission
+from .drone_data import drone_record
 
 
 def current_altitude(telemetry, fallback):
@@ -46,5 +47,6 @@ class DetectionPipeline:
         record['visual_lock'] = self.target_lock.update(observation, sample_time=sample_time,
                                                       now=time.monotonic())
         record['autonomy'] = self.mission.snapshot()
+        record['drone_data'] = drone_record(record)
         return observation, record
 

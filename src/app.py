@@ -55,7 +55,7 @@ def run(args: AppConfig) -> int:
                     observation, record = pipeline.process(frame, received_at=received_at,
                                                            sample_time=sample_time, source=source_name)
                     if publisher is not None:
-                        publisher.publish(record)
+                        publisher.publish(record['drone_data'] if args.drone_data else record)
                     diagnostics.update(frame, observation, record)
                     if recorder is not None:
                         recorder.write(frame, sample_time)
