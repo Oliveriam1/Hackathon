@@ -178,6 +178,19 @@ def build_search_grid(st):
 
 
 # --------------------------- hardware ---------------------------
+def strengthen_pink_to_red(frame):
+    """Shift pink/magenta pixels toward red; leave the rest of the frame unchanged."""
+    b = frame[:, :, 0]
+    g = frame[:, :, 1]
+    r = frame[:, :, 2]
+    pink = (r >= 120) & (b >= 70) & (r >= g + 20) & (r >= b)
+    if np.any(pink):
+        r[pink] = 255
+        g[pink] = (g[pink].astype(np.uint16) * 45 // 100).astype(np.uint8)
+        b[pink] = (b[pink].astype(np.uint16) * 35 // 100).astype(np.uint8)
+    return frame
+
+
 class Camera:
     def __init__(self):
         try:
@@ -495,6 +508,7 @@ def tune_mode(cam):
         frame = cam.read()
         if frame is None:
             continue
+        frame = strengthen_pink_to_red(frame)
         REDNESS_MIN = cv2.getTrackbarPos("REDNESS_MIN", win)
         R_MIN = cv2.getTrackbarPos("R_MIN", win)
         RED_FRACTION_MIN = cv2.getTrackbarPos("RED_FRACTION_MIN x100", win) / 100.0
@@ -536,6 +550,7 @@ def run(args):
             frame = cam.read()
             if frame is None:
                 continue
+            frame = strengthen_pink_to_red(frame)
             now = time.time()
             st = get_drone_state()
             H, W = frame.shape[:2]
