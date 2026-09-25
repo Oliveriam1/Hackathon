@@ -9,11 +9,20 @@ a `flight_ready` zůstává false. Simulace používá syntetický bod, ne živo
 python3 tools/simulate_approach.py
 python3 tools/simulate_approach.py --loss 3 7 --output trajectory.jsonl
 python3 tools/simulate_approach.py --moving --seconds 40
+python3 tools/simulate_approach.py --takeoff-height 5 --seconds 40 --output takeoff.jsonl
 ```
 
-Začíná již ve vzduchu, řeší vodorovný pohyb v rovině sever/východ. Cíl je
+Bez `--takeoff-height` začíná již ve vzduchu a řeší vodorovný pohyb v rovině sever/východ. Cíl je
 8 m na sever a 5 m na východ od začátku; pohyblivý scénář mění východní souřadnici.
 Zóna ±20 m je syntetická obdélníková hranice, nikoliv rozpoznání pásky.
+
+S `--takeoff-height 5` začíná na zemi: `TAKING_OFF` → `TAKEOFF_SETTLING` →
+`AIRBORNE` → přelet nad bod. Výška musí být 1–20 m. Přelet se povolí po celé
+sekundě ve výškové toleranci ±0.2 m a při svislé rychlosti pod 0.15 m/s.
+Do té doby jsou vodorovné povely nulové. Stoupání v modelu je omezené na 1 m/s,
+svislé zrychlení na 1 m/s². Výstup obsahuje výšku, svislou rychlost a
+`takeoff_complete`. `takeoff.py` ověřuje čerstvost dat, souvislost měření
+a časový limit 60 s; chyba zůstane aktivní do nového spuštění.
 
 `approach.py` obsahuje regulátor: rychlost do 2 m/s, zrychlení 1 m/s², zpomalování
 před cílem, potvrzení příletu při vzdálenosti do 0.4 m a rychlosti pod 0.15 m/s
@@ -33,12 +42,23 @@ ani o model větru, setrvačnosti a regulátorů skutečného dronu.
 
 Samostatný `tools/run_sitl_approach.py` je připraven pro lokální SITL. Potřebuje
 nainstalované `pymavlink` a běžící simulovaný Copter na TCP 127.0.0.1:5760.
-SITL musí být již ve vzduchu, armed a v GUIDED; skript sám nearmuje, nevzlétá
-a nemění letový režim. Nepoužívejte přesměrování na skutečný autopilot.
+Bez `--takeoff-height` musí být SITL již ve vzduchu, armed a v GUIDED.
+Nepoužívejte přesměrování na skutečný autopilot.
 
 ```bash
 python3 tools/run_sitl_approach.py --port 5760 --target 8 5 --seconds 30
+python3 tools/run_sitl_approach.py --takeoff-height 5 --target 8 5 --seconds 30
 ```
+
+Volitelný automatický vzlet vyžaduje nearmovaný Copter na zemi u home.
+`sitl_takeoff.py` nastaví GUIDED, běžně armuje (bez force) a pošle TAKEOFF.
+Každý povel vyžaduje přijatý COMMAND_ACK a odpovídající stav telemetrie;
+odmítnutí nebo timeout test ukončí. Samotné přijetí TAKEOFF nestačí:
+přelet začne až po potvrzení ustálené výšky z GLOBAL_POSITION_INT.relative_alt
+(nad home, nikoliv terénem). Omezení rychlosti vzletu v SITL určuje autopilot.
+Při chybě skript neopakuje armování ani automaticky nelanduje/disarmuje;
+stav simulátoru je nutné zkontrolovat v jeho konzoli. `--seconds` v SITL měří
+až dobu přeletu po vzletu, v lokálním modelu celou simulaci.
 
 Před jakýmkoliv pohybovým povelem ověří zprávy SIMSTATE a LOCAL_POSITION_NED
 od stejného zdroje jako heartbeat ArduPilotu. Bez těchto dat končí. Sleduje

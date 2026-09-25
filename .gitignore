@@ -23,4 +23,5 @@ logs/*
 # Models / large files
 *.pt
 *.onnx
-tests/
+tests/*
+!tests/test_takeoff.py

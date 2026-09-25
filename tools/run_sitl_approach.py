@@ -1,4 +1,4 @@
-"""Integrační test lokálního ArduPilot SITL; vzlet a GUIDED nastavte v simulátoru.
+"""Integrační test lokálního ArduPilot SITL; volitelně včetně vzletu.
 
 Nevstupuje do běžné kamerové pipeline. Cíl je syntetický bod v metrech od
 počáteční polohy simulátoru. Vyžaduje zprávu SIMSTATE ze stejného autopilota.
@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.approach import ApproachController, TargetEstimate, VehicleState
 from src.field import GroundPoint
 from src.sitl_velocity import SitlVelocityAdapter
+from src.sitl_takeoff import automatic_takeoff
 
 
 def main():
@@ -19,7 +20,10 @@ def main():
     parser.add_argument('--port', type=int, default=5760)
     parser.add_argument('--target', nargs=2, type=float, default=(8., 5.), metavar=('NORTH', 'EAST'))
     parser.add_argument('--seconds', type=float, default=30.)
+    parser.add_argument('--takeoff-height', type=float, help='Automatický vzlet v SITL: 1–20 m nad home.')
     args = parser.parse_args()
+    if args.takeoff_height is not None and not (math.isfinite(args.takeoff_height) and 1 <= args.takeoff_height <= 20):
+        parser.error('--takeoff-height musí být 1 až 20 m.')
     if not 1 <= args.port <= 65535 or not math.isfinite(args.seconds) or not 0 < args.seconds <= 300:
         parser.error('Neplatný port nebo délka testu.')
     if not all(math.isfinite(v) and abs(v) < 19 for v in args.target):
@@ -35,9 +39,11 @@ def main():
         heartbeat = connection.wait_heartbeat(timeout=10)
         if heartbeat is None or heartbeat.autopilot != mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA:
             raise RuntimeError('Chybí heartbeat ArduPilotu.')
+        if heartbeat.type not in (2, 3, 4, 13, 14, 15, 29, 35):
+            raise RuntimeError('Test vyžaduje simulovaný Copter.')
         system, component = heartbeat.get_srcSystem(), heartbeat.get_srcComponent()
         connection.target_system, connection.target_component = system, component
-        for message_id in (32, 164):  # LOCAL_POSITION_NED, SIMSTATE
+        for message_id in (32, 33, 164):  # LOCAL_POSITION_NED, GLOBAL_POSITION_INT, SIMSTATE
             connection.mav.command_long_send(system, component,
                 mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, message_id, 100000, 0, 0, 0, 0, 0)
         until = time.monotonic()+10
@@ -57,6 +63,23 @@ def main():
                 break
         if not seen_sim or position is None:
             raise RuntimeError('Nepotvrzený SITL: chybí SIMSTATE nebo lokální poloha.')
+        if args.takeoff_height is not None:
+            automatic_takeoff(connection, mavutil.mavlink, args.takeoff_height, simulator_confirmed=True)
+            # Vyžádej znovu čerstvou lokální polohu a heartbeat po vzletu.
+            position = heartbeat = None
+            until = time.monotonic()+5
+            while time.monotonic() < until:
+                msg = connection.recv_match(blocking=True, timeout=.1)
+                if msg is None or (msg.get_srcSystem(), msg.get_srcComponent()) != (system, component):
+                    continue
+                if msg.get_type() == 'LOCAL_POSITION_NED':
+                    position, last_position = msg, time.monotonic()
+                if msg.get_type() == 'HEARTBEAT':
+                    heartbeat, last_heartbeat = msg, time.monotonic()
+                if position is not None and heartbeat is not None and time.monotonic()-last_position <= .3:
+                    break
+            if position is None or heartbeat is None or time.monotonic()-last_position > .3:
+                raise RuntimeError('Po vzletu chybí čerstvá lokální poloha nebo heartbeat.')
         guided_mode = connection.mode_mapping().get('GUIDED')
         def ready(hb):
             return (guided_mode is not None and hb.custom_mode == guided_mode and
