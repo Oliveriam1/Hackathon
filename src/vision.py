@@ -171,10 +171,18 @@ def annotate_red(image, observation, thresholds=None):
     center = (width//2, height//2)
     cv2.drawMarker(view, center, (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
     point = observation.measurement if observation.measured else observation.target
+    tracking = red.get('tracking', {})
+    _text(view, f"ID: {tracking.get('track_id') or '--'}  kandidati: {len(observation.circles)}",
+          (10, 20), (255, 255, 255), .5)
     if point is not None:
         color = (0, 255, 0) if observation.confirmed and observation.measured else (0, 165, 255)
         position = _draw_ellipse(view, point, color, 2)
+        cv2.drawMarker(view, position, color, cv2.MARKER_CROSS, 12, 1)
         cv2.line(view, center, position, color, 1)
+        kind = 'MERENI' if observation.measured else 'PREDIKCE'
+        _text(view, f'{kind}: {point.x:.1f}, {point.y:.1f} px', (10, 40), color, .5)
+        _text(view, f'Odchylka: {point.x-width/2:+.1f}, {point.y-height/2:+.1f} px',
+              (10, 60), color, .5)
     _text(view, observation.status, (10, height-15), (255, 255, 255), .55)
     return view
 

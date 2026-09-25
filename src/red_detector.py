@@ -260,14 +260,20 @@ class RedDetector:
             # float64 eliminuje interpretaci Nx2 float32 jako kontury v cv2.moments.
             weights = strength[y:y+h, x:x+w].astype(np.float64)*component
             moments = cv2.moments(weights)
-            cx, cy = x+x0+moments['m10']/moments['m00'], y+y0+moments['m01']/moments['m00']
+            # U rozlišitelného obrysu chceme geometrický střed, ne nejjasnější
+            # část disku. Barevné těžiště ponecháváme jen pro drobné komponenty.
+            if tiny:
+                cx, cy = x+x0+moments['m10']/moments['m00'], y+y0+moments['m01']/moments['m00']
+            else:
+                cx, cy = circle.x, circle.y
             circle = Circle(cx, cy, circle.radius, circle.minor_radius, circle.angle)
             quality = min(1., contrast/80)*0.25 + (0.45 if tiny else 0.65)
             if ratio is not None:
                 quality -= min(0.15, abs(math.log(ratio))*0.08)
             quality = max(0., min(1., quality))
             report.update(accepted=True, reason='TINY_SHAPE_UNRESOLVED' if tiny else 'ACCEPTED',
-                          score=quality, center_px=[cx, cy])
+                          score=quality, center_px=[cx, cy],
+                          center_method='color_centroid' if tiny else 'ellipse_center')
             candidates.append(circle)
             scores.append(quality)
         validated = time.perf_counter()

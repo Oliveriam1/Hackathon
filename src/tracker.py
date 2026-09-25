@@ -97,7 +97,7 @@ class TimedTargetTracker:
             if ranked and not ambiguous:
                 chosen = ranked[0][1]
         if chosen is None:
-            self.status = 'AMBIGUOUS' if ambiguous else ('PREDICTION' if self.track else 'SEARCHING')
+            self.status = 'AMBIGUOUS' if ambiguous else ('PREDICTION' if self.confirmed else 'SEARCHING')
             if not self.confirmed:
                 self.first_seen, self.hits = None, 0
             return TrackState(self.prediction(now) if self.confirmed else None,
