@@ -5,12 +5,8 @@ x = náklon kamery doprava (+) / doleva (-), y = dopředu (+) / dozadu (-),
 a sudo systemctl enable --now pigpiod.
 """
 
-X_PIN, Y_PIN = 18, 13                    # BCM
-X_CENTER_US, Y_CENTER_US = 1500, 1500    # pulz, při kterém kamera míří kolmo dolů
-US_PER_DEG = 1000.0 / 90.0               # 500..2500 us na 180°
-X_DIR, Y_DIR = 1, 1                      # -1, pokud se osa točí opačně
-X_LIMITS = (-60.0, 60.0)
-Y_LIMITS = (-45.0, 45.0)
+from .config import (X_PIN, Y_PIN, X_CENTER_US, Y_CENTER_US, US_PER_DEG,
+                     X_DIR, Y_DIR, X_LIMITS, Y_LIMITS)
 
 
 class _Lgpio:
