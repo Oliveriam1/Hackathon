@@ -172,3 +172,12 @@ Detaily zapojení, geometrických předpokladů a aktivace jsou v [DETECTION.md]
 Výpočet GPS a posunu cíle na zemi je nyní zapojen přes `--locate-target`.
 Vyžaduje telemetrii, známou rovinu terče a úhly kamery; nejde o letový povel.
 Konfiguraci a omezení odhadu popisuje [DETECTION.md](DETECTION.md#poloha-tečky-na-zemi).
+
+## Simulace přeletu nad tečku
+
+```bash
+python3 tools/simulate_approach.py --loss 3 7
+```
+
+Samostatná simulace ověřuje přiblížení, zpomalení, zastavení při ztrátě cíle a návrat.
+Není napojená na skutečný dron. SITL spouštěč, omezení a výsledky viz [SIMULATION.md](SIMULATION.md).
