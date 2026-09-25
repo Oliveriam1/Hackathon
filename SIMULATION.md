@@ -38,6 +38,39 @@ Kinematický model má konečné brzdění: nulový povel neznamená okamžité 
 Kontrola zóny zahrnuje jednoduchou brzdnou dráhu. Nejde o ověřenou letovou geofence
 ani o model větru, setrvačnosti a regulátorů skutečného dronu.
 
+## Hledání po poli v lokálním modelu
+
+```bash
+python3 tools/simulate_approach.py --search --takeoff-height 5 --seconds 300 --output search.jsonl
+python3 tools/simulate_approach.py --search --no-target --seconds 300
+```
+
+`RectangleSweep` vytváří střídavé řádky v explicitním obdélníku s rezervou
+1 m od hran. Výchozí pole je sever/východ −10 až +10 m; lze změnit přes
+`--field-bounds N_MIN N_MAX E_MIN E_MAX`. Start (0, 0) musí ležet uvnitř.
+`--lane-spacing` nastavuje největší rozestup řádků (výchozí 4 m).
+Prázdná či neplatná hranice není povolený prostor. Tento plánovač nepřijímá
+obecný polygon a neumí získat hranice z červenobílé pásky.
+
+`SearchMission` po vzletu postupuje po bodech trasy (`SEARCHING`). Poloha cíle
+se jí zpřístupní až v ideálním kruhovém dosahu `--sensor-radius` (výchozí 3 m).
+Tento model nenahrazuje kameru, výpočet zorného pole ani potvrzování detekcí.
+Při čerstvém platném měření přejde na přelet a ustálení nad cílem. Při ztrátě
+požaduje nulovou rychlost (`TARGET_LOST_HOLD`) a po 2 s obnoví původní bod trasy.
+Po projetí všech bodů bez cíle zůstane stát (`SEARCH_COMPLETE`). Dokončení
+trasy není zárukou detekce všeho: dosah senzoru, rozestup, okraje a pohyb cíle
+mohou způsobit nepozorované oblasti. Výstup uvádí `target_visible`,
+`search_waypoint` (index od nuly) a `search_waypoint_count`; skutečná poloha
+syntetického cíle je v logu pouze pro vyhodnocení.
+
+Hledání je zatím zapojené pouze do lokální kinematické simulace. SITL spouštěč
+nadále testuje přelet k předem zadanému bodu. `main.py` ani živou kameru nový
+plánovač neřídí.
+
+V režimu hledání nyní každý povel kontroluje také `ZoneGuard` s rezervou a
+brzdnou dráhou. Mapa je explicitně označená `synthetic_field`. Pixelové
+rozpoznávání pásky v kamerové aplikaci a jeho omezení popisuje [BOUNDARY.md](BOUNDARY.md).
+
 ## Integrační test s ArduPilot SITL
 
 Samostatný `tools/run_sitl_approach.py` je připraven pro lokální SITL. Potřebuje

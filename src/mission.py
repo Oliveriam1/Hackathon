@@ -1,12 +1,4 @@
-"""Hranice mezi pozorováním a autonomní misí.
+"""Kompatibilní vstup mise; bez settings je řízení vypnuté."""
+from .mission_controller import MissionController
 
-Fáze 1: mise zůstává neimplementovaná. Vizuální LOCKED není letový stav.
-Přechody vzlet/hledání/přelet zde přibudou po implementaci řídicích komponent.
-"""
-
-
-class Mission:
-    def snapshot(self):
-        return {'enabled': False, 'state': 'NOT_IMPLEMENTED',
-                'missing': ['flight_adapter', 'zone_boundary', 'gimbal_feedback',
-                            'exposure_telemetry_synchronization']}
+Mission = MissionController

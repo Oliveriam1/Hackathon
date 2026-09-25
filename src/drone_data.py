@@ -45,6 +45,7 @@ def drone_record(record, *, session_id=None, max_age_s=0.25):
         'world_position': record['geolocation'] if valid else None,
         'world_position_status': record.get('geolocation_status', 'UNAVAILABLE'),
         'flight_ready': False,
+        'boundary': record.get('boundary', {'zone_state': 'ZONE_UNKNOWN', 'movement_allowed': False}),
         'flight_command': None,
         'gimbal': record.get('gimbal', {'enabled': False, 'state': 'DISABLED'}),
     }

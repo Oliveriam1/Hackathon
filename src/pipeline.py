@@ -1,6 +1,7 @@
 """Zpracování snímku a sestavení dat; nezávislé na GUI a zdroji obrazu."""
 import time
 import math
+from dataclasses import replace
 from uuid import uuid4
 from .vision import Vision
 from .target_lock import TargetLock
@@ -45,6 +46,8 @@ class DetectionPipeline:
         self.gimbal_controller = None
         self.gimbal_angles = None
         self.locator = TargetLocator(config)
+        from .boundary_detector import RedWhiteTapeDetector
+        self.boundary_detector = RedWhiteTapeDetector() if config.detect_boundary else None
         if config.track_camera and not config.gimbal_dry_run and gimbal is None:
             raise RuntimeError('Automatické sledování kamery vyžaduje připojená serva.')
 
@@ -83,6 +86,21 @@ class DetectionPipeline:
 
     def process(self, frame, *, received_at, sample_time, source):
         observation = self.vision.observe(frame, sample_time=sample_time)
+        boundary = {'enabled': self.boundary_detector is not None, 'state': 'DISABLED',
+                    'segments_px': [], 'zone_state': 'ZONE_UNKNOWN', 'movement_allowed': False}
+        if self.boundary_detector is not None:
+            started = time.perf_counter()
+            tape = self.boundary_detector.detect(frame, sample_time=sample_time)
+            age = time.monotonic()-sample_time
+            fresh = math.isfinite(age) and 0 <= age <= .25
+            boundary.update(state=('TAPE_CANDIDATES' if tape.segments_px else 'NO_TAPE_OBSERVED') if fresh else 'STALE',
+                            segments_px=tape.segments_px, sample_age_ms=age*1000 if math.isfinite(age) else None,
+                            processing_ms=(time.perf_counter()-started)*1000,
+                            live_observation=source == 'camera' and fresh)
+        boundary_ms = boundary.get('processing_ms', 0.)
+        observation = replace(observation, boundary=boundary,
+                              processing_ms=observation.processing_ms+boundary_ms,
+                              stage_ms={**(observation.stage_ms or {}), 'boundary': boundary_ms})
         self.sequence += 1
         record = detection_record(observation, sequence=self.sequence,
                                   received_at=received_at, source=source)
@@ -90,6 +108,7 @@ class DetectionPipeline:
         record['visual_lock'] = self.target_lock.update(observation, sample_time=sample_time,
                                                       now=time.monotonic())
         record['autonomy'] = self.mission.snapshot()
+        record['boundary'] = boundary
         # Úhly platné před novým povelem, nikoli poloha požadovaná až pro další snímek.
         from .geolocation import GimbalAngles
         angles, basis = None, 'unknown'

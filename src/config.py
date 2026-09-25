@@ -46,6 +46,7 @@ class AppConfig:
     headless: bool = False
     status: bool = False
     drone_data: bool = False
+    detect_boundary: bool = False
     diagnostics: Path | None = None
     record_dir: Path | None = None
     sensitivity: float = 1.5
@@ -97,6 +98,7 @@ def parse_args(argv=None) -> AppConfig:
     parser.add_argument('--headless', action='store_true', help='Jen data, bez grafického okna; ukončení Ctrl+C.')
     parser.add_argument('--status', action='store_true', help='Čitelný stav 1x za sekundu místo JSON v terminálu.')
     parser.add_argument('--drone-data', action='store_true', help='Pouze JSON kontrakt vizuálních dat pro řídicí část, bez odesílání povelů.')
+    parser.add_argument('--detect-boundary', action='store_true', help='Kandidáty červenobílé pásky v obraze a JSON; neověřuje uzavřenou zónu.')
     parser.add_argument('--diagnostics', type=Path, help='Uloží nejvýše 30 dvojic raw/marked snímků, každé 2 s.')
     parser.add_argument('--record-dir', type=Path, help='Uloží každý zpracovaný snímek a čas pro offline vyhodnocení; délku omezte --frames.')
     parser.add_argument('--sensitivity', type=float, choices=(1, 1.5, 2, 3), default=1.5)

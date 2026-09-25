@@ -25,3 +25,6 @@ logs/*
 *.onnx
 tests/*
 !tests/test_takeoff.py
+!tests/test_search.py
+!tests/test_boundary.py
+!tests/test_mission.py

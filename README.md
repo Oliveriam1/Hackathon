@@ -181,3 +181,9 @@ python3 tools/simulate_approach.py --loss 3 7
 
 Samostatná simulace ověřuje přiblížení, zpomalení, zastavení při ztrátě cíle a návrat.
 Není napojená na skutečný dron. SITL spouštěč, omezení a výsledky viz [SIMULATION.md](SIMULATION.md).
+
+## Celá mise – simulační řadič
+
+`python3 tools/run_mission.py --seconds 180` spustí společný řadič od kontroly
+startu přes vzlet a hledání po držení cíle a výstup souřadnic. Podrobný kontrakt,
+scénáře poruch a dosud chybějící části skutečného letu jsou v [MISSION.md](MISSION.md).

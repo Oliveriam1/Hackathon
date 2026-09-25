@@ -26,6 +26,7 @@ class Observation:
     stage_ms: dict | None = None
     detector_mode: str = 'geometry'
     red: dict | None = None     # režim red: geometry, exp_px, detection, mask (pro náhled jako red_tracker.py)
+    boundary: dict | None = None
 
     @property
     def offset(self):
@@ -187,7 +188,7 @@ def annotate_red(image, observation, thresholds=None):
     return view
 
 
-def annotate_observation(image, observation):
+def _annotate_target(image, observation):
     if observation.detector_mode == 'red' and observation.red is not None:
         return annotate_red(image, observation, observation.red.get('thresholds'))
     output = image.copy()
@@ -208,4 +209,16 @@ def annotate_observation(image, observation):
         dx, dy = observation.offset
         _text(output, f'{center[0]}, {center[1]} px  odchylka {dx:+.2f} {dy:+.2f}', (10, 20), color, 0.5)
     _text(output, observation.status, (10, height-15), (255, 255, 255), 0.6)
+    return output
+
+
+def annotate_observation(image, observation):
+    output = _annotate_target(image, observation)
+    boundary = observation.boundary or {}
+    if boundary.get('enabled'):
+        for segment in boundary.get('segments_px', ()):
+            x0, y0, x1, y1 = map(round, segment)
+            cv2.line(output, (x0, y0), (x1, y1), (0, 220, 255), 2)
+        _text(output, 'PASKA: '+boundary['state']+' | ZONA NEOVERENA',
+              (10, max(15, output.shape[0]-40)), (0, 220, 255), .45)
     return output
