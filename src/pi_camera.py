@@ -26,11 +26,14 @@ class PiCamera:
                 'Picamera2 není dostupné. Na Pi nainstalujte python3-picamera2 '
                 'a použijte venv s --system-site-packages.'
             ) from error
-        cameras = Picamera2.global_camera_info()
-        if not 0 <= self.index < len(cameras):
-            raise RuntimeError(f'CSI kamera {self.index} není dostupná. Ověřte rpicam-hello --list-cameras.')
+        # Profil musí dostat úplně první volání libcamery (jako red_tracker.py).
+        # Dřívější global_camera_info() spustí libcameru se systémovým ov5647.json
+        # a pozdější tuning= se tiše ignoruje -> růžový obraz NoIR kamery.
         tuning = Picamera2.load_tuning_file(self.tuning_file) if self.tuning_file else None
-        camera = Picamera2(camera_num=self.index, tuning=tuning)
+        try:
+            camera = Picamera2(camera_num=self.index, tuning=tuning)
+        except IndexError as error:
+            raise RuntimeError(f'CSI kamera {self.index} není dostupná. Ověřte rpicam-hello --list-cameras.') from error
         try:
             # RGB888 v Picamera2 poskytuje bajty B,G,R, jak je očekává OpenCV.
             config = camera.create_video_configuration(
@@ -57,7 +60,8 @@ class PiCamera:
             colour = f'ColourGains {gains}, ColourTemperature {metadata.get("ColourTemperature", "?")} K'
         except Exception:
             colour = 'vyvážení barev neznámé'
-        print(f'Kamera: profil {self.tuning_file or "systémový (bez NoIR)"}, '
+        print(f'Kamera: požadovaný profil {self.tuning_file or "systémový (bez NoIR)"} '
+              f'(skutečný ukazuje řádek libcamery "Using tuning file"), '
               f'{self.size[0]}x{self.size[1]}, {colour}', file=sys.stderr)
 
     def read(self):
