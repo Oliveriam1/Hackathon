@@ -32,7 +32,11 @@ def parse_args():
     parser.add_argument('--diagnostics', type=Path, help='Uloží nejvýše 30 dvojic raw/marked snímků, každé 2 s.')
     parser.add_argument('--sensitivity', type=float, choices=(1, 1.5, 2, 3), default=1.5)
     parser.add_argument('--hough', action='store_true', help='Pomalá záloha pro přerušené kruhové hrany (pro porovnání).')
-    parser.add_argument('--detector', choices=('geometry', 'red'), default='geometry')
+    parser.add_argument('--detector', choices=('geometry', 'red'), default='red',
+                        help='red (výchozí) = červená tečka 1:1 jako red_tracker.py; geometry = kolečko v obdélníku.')
+    parser.add_argument('--altitude', type=float, default=20.0,
+                        help='Výška nad zemí v m pro očekávanou velikost tečky (jako red_tracker.py 20 m); '
+                             's --mavlink se použije relative_alt z ArduPilotu.')
     parser.add_argument('--red-diameter-px', type=float, help='Očekávaný průměr červené tečky v pixelech; jinak bez filtru velikosti.')
     parser.add_argument('--tuning-file', help='CSI profil (výchozí ov5647_noir.json: kamera bez IR filtru, jinak růžový obraz). '
                                               'Hodnota none ponechá systémový profil.')
@@ -63,6 +67,8 @@ def parse_args():
         parser.error('--tuning-file vyžaduje --picamera.')
     if args.hough and args.detector == 'red':
         parser.error('--hough je pouze pro --detector geometry.')
+    if not np.isfinite(args.altitude) or args.altitude <= 0:
+        parser.error('--altitude musí být kladná výška v metrech.')
     if args.frames is not None and args.frames < 1:
         parser.error('--frames musí být kladné.')
     if args.baud <= 0 or (args.target_system is not None and not 1 <= args.target_system <= 255):
@@ -86,6 +92,15 @@ def parse_args():
     return args
 
 
+def current_altitude(telemetry, fallback):
+    """relative_alt z ArduPilotu, pokud je čerstvá a kladná, jinak --altitude."""
+    if telemetry is not None:
+        item = telemetry.snapshot()['messages'].get('GLOBAL_POSITION_INT')
+        if item and item['age_s'] <= 0.5 and item['values']['relative_alt_m'] > 0.5:
+            return item['values']['relative_alt_m']
+    return fallback
+
+
 def main() -> int:
     args = parse_args()
     window_name = "Kamera - Q / Esc: konec"
@@ -98,11 +113,12 @@ def main() -> int:
             if args.mavlink:
                 from src.telemetry import MAVLinkTelemetry
                 telemetry = stack.enter_context(MAVLinkTelemetry(args.mavlink, args.baud, args.target_system))
+            gimbal = None
             if args.servo:
                 # red_tracker.py zapíná serva před kamerou.
                 from src.gimbal import Gimbal
                 try:
-                    stack.enter_context(Gimbal())
+                    gimbal = stack.enter_context(Gimbal())
                 except RuntimeError as error:
                     if not args.jako_red_tracker:
                         raise
@@ -142,6 +158,10 @@ def main() -> int:
                 print(f'Snímek uložen: {args.snapshot.resolve()}')
                 return 0
             vision = Vision(mode=args.detector, expected_diameter=args.red_diameter_px)
+            if args.detector == 'red':
+                vision.detector.altitude_source = lambda: current_altitude(telemetry, args.altitude)
+                if gimbal is not None:
+                    vision.detector.gimbal_source = lambda: (gimbal.x, gimbal.y)
             vision.detector.use_hough = args.hough
             vision.detector.sensitivity = args.sensitivity
             target_lock = TargetLock()

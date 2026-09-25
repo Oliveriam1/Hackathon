@@ -46,6 +46,8 @@ class Vision:
 
     def reset(self):
         self.tracker.reset()
+        if hasattr(self.detector, 'reset'):
+            self.detector.reset()  # red: zapomenout poslední polohu a výřez
         self.previous_shape = None
         self.previous_sensitivity = None
 
