@@ -35,6 +35,11 @@ class TargetLock:
         if previous_time is not None and sample_time-previous_time > self.max_age_s:
             self._centered_since = None
         self._last_sample = sample_time
+        red = getattr(observation, 'red', None)
+        if red and red.get('tracking', {}).get('state') in ('AMBIGUOUS', 'STALE_OR_REPEATED'):
+            self._centered_since = self._last_center = None
+            result['state'] = red['tracking']['state']
+            return result
         measurement = observation.measurement
         if not observation.confirmed or not observation.measured or measurement is None:
             self._centered_since = None

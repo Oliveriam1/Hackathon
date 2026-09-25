@@ -22,7 +22,7 @@ class Tuner:
                   cv2.getTrackbarPos('RED_FRACTION x100', self.window) / 100,
                   cv2.getTrackbarPos('SATURATION x10', self.window) / 10 if self.camera is not None else None)
         if values == self.last:
-            return
+            return False
         self.detector.redness_min, self.detector.r_min, self.detector.red_fraction_min = values[:3]
         if self.camera is not None and (self.last is None or values[3] != self.last[3]):
             self.camera.set_saturation(values[3])
@@ -31,6 +31,7 @@ class Tuner:
         if values[3] is not None:
             command += f' --saturation {values[3]:.1f}'
         print(f'Ladění: {command}', file=sys.stderr)
+        return True
 
 
 class Preview:
@@ -58,21 +59,20 @@ class Preview:
         background = cv2.cvtColor(self.vision.detector.edges, cv2.COLOR_GRAY2BGR) if self.show_edges else frame
         cv2.imshow(self.window, annotate_observation(background, observation))
         key = cv2.waitKey(1) & 0xFF
-        if self.tuner is not None:
-            self.tuner.update()
+        tuned = self.tuner.update() if self.tuner is not None else False
         changed = key in (ord('1'), ord('2'), ord('3'), ord('b'), ord('B'))
         if key in (ord('1'), ord('2'), ord('3')):
             self.vision.detector.sensitivity = int(chr(key))
         if key in (ord('b'), ord('B')):
             self.vision.detector.sensitivity = 1.5
-        if self.camera is None and changed:
+        if tuned or (self.camera is None and changed):
             self.vision.reset()
         if key in (ord('e'), ord('E')):
             self.show_edges = not self.show_edges
         keep_running = key not in (ord('q'), ord('Q'), 27)
         if keep_running:
             keep_running = cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) >= 1
-        return keep_running, changed
+        return keep_running, changed or tuned
 
     def __exit__(self, *args):
         cv2.destroyAllWindows()

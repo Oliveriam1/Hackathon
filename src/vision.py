@@ -6,7 +6,7 @@ import numpy as np
 import time
 from .circle_detector import Circle, CircleDetector
 from .rectangle_detector import find_rectangles, enclosing_rectangle, find_faint_quadrilaterals
-from .tracker import TargetTracker
+from .tracker import TargetTracker, TimedTargetTracker
 from .red_detector import RedDetector
 
 MIN_AXIS_RATIO = 0.35  # elipsa kolečka až při ~70° od kolmého pohledu
@@ -42,7 +42,7 @@ class Vision:
             raise ValueError('Neznámý režim detekce.')
         self.mode = mode
         self.detector = RedDetector(expected_diameter) if mode == 'red' else CircleDetector()
-        self.tracker = TargetTracker()
+        self.tracker = TimedTargetTracker() if mode == 'red' else TargetTracker()
         self.reset()
 
     def reset(self):
@@ -52,23 +52,34 @@ class Vision:
         self.previous_shape = None
         self.previous_sensitivity = None
 
-    def observe(self, frame):
+    def observe(self, frame, *, sample_time=None):
         started = time.perf_counter()
         if self.mode == 'red':
             if self.previous_shape != frame.shape:
                 self.reset()
             self.previous_shape = frame.shape
-            candidates = self.detector.detect(frame)
-            state = self.tracker.update(candidates, lambda prediction: [])
+            timestamp = time.monotonic() if sample_time is None else sample_time
+            roi = self.tracker.search_roi(frame.shape, timestamp)
+            candidates = self.detector.detect(frame, roi=roi)
+            detection_stages = dict(self.detector.stage_ms)
+            # Při oříznutí cíle nebo prázdném ROI rozšíříme hledání ihned.
+            if roi is not None and (not candidates or any(r['reason'] == 'CLIPPED' for r in self.detector.reports)):
+                candidates = self.detector.detect(frame)
+                detection_stages = {key: value+self.detector.stage_ms.get(key, 0)
+                                    for key, value in detection_stages.items()}
+            tracking_started = time.perf_counter()
+            state = self.tracker.update(candidates, sample_time=timestamp, scores=self.detector.scores)
             elapsed = (time.perf_counter()-started)*1000
+            stages = detection_stages
+            stages['tracking'] = (time.perf_counter()-tracking_started)*1000
+            stages['total'] = elapsed
             height, width = frame.shape[:2]
-            red = dict(geometry=self.detector.geometry, exp_px=self.detector.exp_px,
-                       detection=self.detector.last_detection, last_pos=self.detector.last_pos,
-                       thresholds=self.detector.thresholds)
+            red = dict(geometry=self.detector.geometry, mask=self.detector.edges,
+                       diagnostics=self.detector.diagnostics(), tracking=self.tracker.diagnostics())
             return Observation(candidates, f'{state.status} | red | {elapsed:.0f} ms', [],
                                state.confirmed, elapsed, state.target, state.measured,
                                (width, height), self.tracker.last_measurement,
-                               {'red_and_tracking': elapsed}, 'red', red)
+                               stages, 'red', red)
         gray, edges = self.detector.prepare(frame)
         prepared = time.perf_counter()
         if self.previous_shape != frame.shape or self.previous_sensitivity != self.detector.sensitivity:
@@ -144,30 +155,27 @@ def _text(image, text, origin, color, scale):
 
 
 def annotate_red(image, observation, thresholds=None):
-    """Náhled jako red_tracker.py --show: červená i kulatá růžová přebarvená na čistě červenou."""
-    from .red_detector import red_and_pink_circle_masks
+    """Bez nové segmentace: kreslí přesné kandidáty z použitého snímku."""
     view = image.copy()
     height, width = view.shape[:2]
-    preview_mask, _, _ = red_and_pink_circle_masks(view, **(thresholds or {}))
-    view[preview_mask != 0] = (0, 0, 255)
-    cv2.drawMarker(view, (width // 2, height // 2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
     red = observation.red or {}
-    det, geometry = red.get('detection'), red.get('geometry')
-    if det is not None:
-        c = (int(det['x']), int(det['y']))
-        cv2.circle(view, c, max(12, int(red.get('exp_px') or 0)), (0, 255, 0), 2)
-        cv2.line(view, (width // 2, height // 2), c, (0, 255, 255), 1)
+    debug = red.get('diagnostics', {})
+    for item in debug.get('candidates', []):
+        x, y, w, h = item['box_px']
+        color = (0, 220, 220) if item['accepted'] else (130, 130, 130)
+        cv2.rectangle(view, (x, y), (x+w, y+h), color, 1)
+        _text(view, item['reason'], (x, max(12, y-3)), color, .35)
+    geometry = red.get('geometry')
     if geometry is not None:
-        cv2.drawContours(view, [geometry['contour']], -1, (255, 0, 255), 2)
-        for circle in geometry['circles']:
-            cc = (int(round(circle['center'][0])), int(round(circle['center'][1])))
-            cv2.circle(view, cc, max(3, int(round(circle['radius']))), (0, 255, 0), 2)
-    visible = len(geometry['circles']) if geometry is not None else 0
-    tilt = geometry['angle'] if geometry is not None else None
-    cv2.putText(view, observation.status.split(' | ')[0], (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-    cv2.putText(view, f'Viditelne kruhy: {visible}', (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    tilt_text = f'{tilt:+.1f}' if tilt is not None else 'N/A'
-    cv2.putText(view, f'Naklon objektu: {tilt_text} stupnu', (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.drawContours(view, [geometry['contour']], -1, (255, 0, 255), 1)
+    center = (width//2, height//2)
+    cv2.drawMarker(view, center, (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
+    point = observation.measurement if observation.measured else observation.target
+    if point is not None:
+        color = (0, 255, 0) if observation.confirmed and observation.measured else (0, 165, 255)
+        position = _draw_ellipse(view, point, color, 2)
+        cv2.line(view, center, position, color, 1)
+    _text(view, observation.status, (10, height-15), (255, 255, 255), .55)
     return view
 
 

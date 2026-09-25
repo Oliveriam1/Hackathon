@@ -26,6 +26,8 @@ def detection_record(observation, *, sequence, received_at, source):
         'detector_mode': observation.detector_mode,
         'processing_ms': observation.processing_ms,
         'stage_ms': observation.stage_ms,
+        'detection_diagnostics': observation.red.get('diagnostics') if observation.red else None,
+        'tracking': observation.red.get('tracking') if observation.red else None,
         'geolocation': None,
         'geolocation_status': 'telemetry_and_calibration_not_connected',
     }

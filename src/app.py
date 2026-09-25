@@ -8,9 +8,9 @@ from .config import AppConfig
 from .sources import open_source, save_snapshot
 from .preview import Preview
 from .pipeline import DetectionPipeline
-from .red_detector import GeometryLog
 from .publisher import JSONPublisher
 from .diagnostics import Diagnostics
+from .recording import FrameRecorder
 
 
 def run(args: AppConfig) -> int:
@@ -39,6 +39,9 @@ def run(args: AppConfig) -> int:
                 save_snapshot(frame, args.snapshot)
                 return 0
             pipeline = DetectionPipeline(args, telemetry=telemetry, gimbal=gimbal)
+            recorder = stack.enter_context(FrameRecorder(args.record_dir)) if args.record_dir else None
+            if recorder is not None:
+                print(f'Záznam: {recorder.directory}', file=sys.stderr)
             vision = pipeline.vision
             stream = stack.enter_context(args.output.open('a', encoding='utf-8')) if args.output else sys.stdout
             publisher = JSONPublisher(stream) if args.output or not args.status else None
@@ -47,19 +50,15 @@ def run(args: AppConfig) -> int:
                 print(f'Diagnostika: {diagnostics.directory}', file=sys.stderr)
             preview = None if args.headless else stack.enter_context(Preview(args, vision, camera))
             observation = None
-            geometry_log = GeometryLog() if args.detector == 'red' else None
             while True:
                 if observation is None or camera is not None:
                     observation, record = pipeline.process(frame, received_at=received_at,
                                                            sample_time=sample_time, source=source_name)
-                    if geometry_log is not None:
-                        message = geometry_log.update(observation.red['geometry'], observation.red['last_pos'],
-                                                      observation.frame_size, time.time())
-                        if message:
-                            print(message, file=sys.stderr)  # stdout patří JSON Lines
                     if publisher is not None:
                         publisher.publish(record)
                     diagnostics.update(frame, observation, record)
+                    if recorder is not None:
+                        recorder.write(frame, sample_time)
                 if args.frames is not None and pipeline.sequence >= args.frames:
                     break
                 if args.headless:

@@ -7,12 +7,12 @@ from .mission import Mission
 
 
 def current_altitude(telemetry, fallback):
-    """relative_alt z ArduPilotu, pokud je čerstvá a kladná, jinak --altitude."""
+    """Označený zdroj odhadu; relative_alt není vzdálenost k terči."""
     if telemetry is not None:
         item = telemetry.snapshot()['messages'].get('GLOBAL_POSITION_INT')
         if item and item['age_s'] <= 0.5 and item['values']['relative_alt_m'] > 0.5:
-            return item['values']['relative_alt_m']
-    return fallback
+            return {'value_m': item['values']['relative_alt_m'], 'source': 'telemetry_relative'}
+    return {'value_m': fallback, 'source': 'manual' if fallback is not None else 'unknown'}
 
 
 class DetectionPipeline:
@@ -23,6 +23,11 @@ class DetectionPipeline:
         if config.detector == 'red':
             detector.redness_min, detector.r_min = config.redness_min, config.r_min
             detector.red_fraction_min = config.red_fraction
+            detector.target_diameter_m, detector.hfov_deg = config.target_diameter_m, config.hfov_deg
+            detector.analyze_geometry = config.geometry_debug
+            if config.camera_calibration is not None:
+                from .geolocation import CameraModel
+                detector.camera_model = CameraModel.load(config.camera_calibration)
             detector.altitude_source = lambda: current_altitude(telemetry, config.altitude)
             if gimbal is not None:
                 detector.gimbal_source = lambda: (gimbal.x, gimbal.y)
@@ -33,7 +38,7 @@ class DetectionPipeline:
         self.sequence = 0
 
     def process(self, frame, *, received_at, sample_time, source):
-        observation = self.vision.observe(frame)
+        observation = self.vision.observe(frame, sample_time=sample_time)
         self.sequence += 1
         record = detection_record(observation, sequence=self.sequence,
                                   received_at=received_at, source=source)

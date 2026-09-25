@@ -35,8 +35,12 @@ class Diagnostics:
             detail = '/'.join(f'{timings.get(key, 0):.0f}' for key in
                               ('prepare', 'quadrilaterals', 'circles_and_tracking'))
             if observation.detector_mode == 'red':
-                stage = 'RED' if observation.circles else 'BEZ_CERVENE'
-                detail = f"red:{timings.get('red_and_tracking', 0):.0f}"
+                debug = observation.red or {}
+                stage = debug.get('tracking', {}).get('state', 'SEARCHING')
+                rejected = debug.get('diagnostics', {}).get('rejections', {})
+                stage += ' odmitnuto=' + (','.join(f'{k}:{v}' for k, v in rejected.items()) or '--')
+                detail = '/'.join(f'{timings.get(k, 0):.0f}' for k in
+                                  ('mask', 'components', 'validation', 'geometry', 'tracking'))
             print(f'FPS={fps} | detekce={observation.processing_ms:.0f} ms | '
                   f'4uhelniky={len(observation.rectangles)} | kandidati={len(observation.circles)} | '
                   f'{kind} {position} | {lock} | {stage} | faze_ms={detail}', file=self.stream, flush=True)

@@ -46,6 +46,7 @@ class AppConfig:
     headless: bool = False
     status: bool = False
     diagnostics: Path | None = None
+    record_dir: Path | None = None
     sensitivity: float = 1.5
     hough: bool = False
     detector: str = 'red'
@@ -54,7 +55,11 @@ class AppConfig:
     red_fraction: float = 0.35
     r_min: int = 50
     tune: bool = False
-    altitude: float = 20.0
+    altitude: float | None = None
+    target_diameter_m: float = 0.20
+    hfov_deg: float = 54.0
+    camera_calibration: Path | None = None
+    geometry_debug: bool = False
     red_diameter_px: float | None = None
     tuning_file: str | None = None
     output: Path | None = None
@@ -81,10 +86,11 @@ def parse_args(argv=None) -> AppConfig:
     parser.add_argument('--headless', action='store_true', help='Jen data, bez grafického okna; ukončení Ctrl+C.')
     parser.add_argument('--status', action='store_true', help='Čitelný stav 1x za sekundu místo JSON v terminálu.')
     parser.add_argument('--diagnostics', type=Path, help='Uloží nejvýše 30 dvojic raw/marked snímků, každé 2 s.')
+    parser.add_argument('--record-dir', type=Path, help='Uloží každý zpracovaný snímek a čas pro offline vyhodnocení; délku omezte --frames.')
     parser.add_argument('--sensitivity', type=float, choices=(1, 1.5, 2, 3), default=1.5)
     parser.add_argument('--hough', action='store_true', help='Pomalá záloha pro přerušené kruhové hrany (pro porovnání).')
     parser.add_argument('--detector', choices=('geometry', 'red'), default='red',
-                        help='red (výchozí) = červená tečka 1:1 jako red_tracker.py; geometry = kolečko v obdélníku.')
+                        help='red (výchozí) = červené/růžové tečky s kontrolou tvaru a trackingem; geometry = kolečko v obdélníku.')
     parser.add_argument('--saturation', type=float,
                         help='Sytost barev CSI kamery 0-32 (libcamera Saturation, 1 = beze změny). '
                              'Výchozí nastavení kamery jako red_tracker.py; např. 2 zvýrazní červenou.')
@@ -93,9 +99,11 @@ def parse_args(argv=None) -> AppConfig:
                         help='Práh (R - max(G, B)) / R, výchozí 0.35; nižší přijme i matnou červenou.')
     parser.add_argument('--r-min', type=int, default=50, help='Minimální R, výchozí 50.')
     parser.add_argument('--tune', action='store_true', help='Posuvníky prahů červené a sytosti v okně (jako red_tracker --tune).')
-    parser.add_argument('--altitude', type=float, default=20.0,
-                        help='Výška nad zemí v m pro očekávanou velikost tečky (jako red_tracker.py 20 m); '
-                             's --mavlink se použije relative_alt z ArduPilotu.')
+    parser.add_argument('--altitude', type=float, help='Ruční odhad výšky v metrech; pouze měkké skóre velikosti.')
+    parser.add_argument('--target-diameter-m', type=float, default=0.20, help='Skutečný průměr terče v metrech.')
+    parser.add_argument('--hfov-deg', type=float, default=54.0, help='Jmenovitý horizontální zorný úhel.')
+    parser.add_argument('--camera-calibration', type=Path, help='JSON kalibrace CameraModel pro aktuální rozlišení.')
+    parser.add_argument('--geometry-debug', action='store_true', help='Volitelný geometrický náhled okolí kandidáta.')
     parser.add_argument('--red-diameter-px', type=float, help='Očekávaný průměr červené tečky v pixelech; jinak bez filtru velikosti.')
     parser.add_argument('--tuning-file', help='CSI profil (výchozí ov5647_noir.json: kamera bez IR filtru, jinak růžový obraz). '
                                               'Hodnota none ponechá systémový profil.')
@@ -132,8 +140,12 @@ def parse_args(argv=None) -> AppConfig:
         parser.error('Prahy červené: --redness-min a --r-min 0-255, --red-fraction 0-1.')
     if args.tune and (args.headless or args.detector != 'red'):
         parser.error('--tune vyžaduje okno (bez --headless) a --detector red.')
-    if not np.isfinite(args.altitude) or args.altitude <= 0:
+    if args.altitude is not None and (not np.isfinite(args.altitude) or args.altitude <= 0):
         parser.error('--altitude musí být kladná výška v metrech.')
+    if not np.isfinite(args.target_diameter_m) or args.target_diameter_m <= 0:
+        parser.error('--target-diameter-m musí být kladné číslo.')
+    if not np.isfinite(args.hfov_deg) or not 1 < args.hfov_deg < 179:
+        parser.error('--hfov-deg musí být mezi 1 a 179 stupni.')
     if args.frames is not None and args.frames < 1:
         parser.error('--frames musí být kladné.')
     if args.baud <= 0 or (args.target_system is not None and not 1 <= args.target_system <= 255):
@@ -144,7 +156,7 @@ def parse_args(argv=None) -> AppConfig:
         parser.error('Rozlišení musí být kladné.')
     if args.output and any(path and path.resolve() == args.output.resolve() for path in (args.image, args.video)):
         parser.error('Výstupní data nesmí přepisovat vstupní obraz/video.')
-    if args.snapshot and (args.output or args.headless or args.frames or args.status or args.diagnostics):
+    if args.snapshot and (args.output or args.headless or args.frames or args.status or args.diagnostics or args.record_dir):
         parser.error('--snapshot je samostatný režim fotografie; pro data použijte --headless.')
     if args.camera < 0:
         parser.error("Index kamery musí být nezáporný.")
