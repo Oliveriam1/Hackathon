@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Photograph the field every 10 seconds; optionally upload each image over HTTP.
+"""Photograph the field every 10 seconds and show the latest photo in a browser.
 
 Place the UAV above the field centre, point the camera vertically down and align
 the field width with the image width. Assumes flat ground. Height is AGL, not GNSS
@@ -8,21 +8,165 @@ measure the actual lens FOV before relying on the coverage estimate.
 
 This script does not fly the UAV or move servos. --plan-only needs no camera.
 The saved image has no annotations, resizing, detection or colour correction.
---send-url must point to a receiver accepting an HTTP POST with raw image bytes.
-Without --send-url, photos are saved locally only. Ctrl+C closes the camera.
+Run: python3 field_photo.py
+On a PC on the same network open http://RASPBERRY_PI_IP:8000/.
+No receiver program is needed on the PC. Photos are also saved locally.
+Optional --send-url retains HTTP POST upload support. Ctrl+C closes everything.
 """
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import math
 from pathlib import Path
+import threading
 import time
-from urllib.parse import urlsplit
+from typing import Callable
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from src.pi_camera import PiCamera
+
+
+PHOTO_PAGE = """<!doctype html>
+<html lang="cs"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fotky pole</title>
+<style>
+body{background:#16191d;color:#eee;font:16px sans-serif;margin:20px}
+img{display:block;max-width:100%;height:auto;margin-top:16px}
+a{color:#8fcfff;margin-left:20px} label{display:inline-block;margin:12px 0}
+</style>
+<h1>Fotky pole</h1>
+<p id="status">Čekám na první fotku…</p>
+<label><input id="automatic" type="checkbox" checked> Automaticky zobrazovat nové fotky</label>
+<a id="download" hidden>Stáhnout zobrazenou fotku</a>
+<img id="photo" alt="Fotka pole" hidden>
+<script>
+let etag = '', previousURL = null;
+async function update() {
+  if (!document.getElementById('automatic').checked) {
+    setTimeout(update, 1000); return;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch('/latest', {
+      cache: 'no-store', signal: controller.signal,
+      headers: etag ? {'If-None-Match': etag} : {}
+    });
+    if (response.status === 503) {
+      document.getElementById('status').textContent = 'Čekám na první fotku…';
+    } else if (response.status === 304) {
+      document.getElementById('status').textContent = 'Zobrazeno: ' + document.getElementById('download').download;
+    } else {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const blob = await response.blob();
+      const name = decodeURIComponent(response.headers.get('X-Photo-Filename'));
+      const nextURL = URL.createObjectURL(blob);
+      const image = document.getElementById('photo');
+      const download = document.getElementById('download');
+      image.src = nextURL; image.hidden = false;
+      download.href = nextURL; download.download = name; download.hidden = false;
+      if (previousURL) URL.revokeObjectURL(previousURL);
+      previousURL = nextURL;
+      etag = response.headers.get('ETag');
+      document.getElementById('status').textContent = 'Zobrazeno: ' + name;
+    }
+  } catch (error) {
+    document.getElementById('status').textContent = 'Spojení přerušeno — zkouším znovu. Zobrazená fotka může být stará.';
+  } finally {
+    clearTimeout(timeout);
+    setTimeout(update, 1000);
+  }
+}
+update();
+</script></html>"""
+
+
+class PhotoServer:
+    """Serve only the viewer and latest immutable image; slow viewers cannot block capture.
+
+    Local-network viewer, without authentication. No directory listing/file access.
+    The camera publishes a complete image under a short lock after saving it.
+    """
+    def __init__(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+        self.host, self.port = host, port
+        self._lock = threading.Lock()
+        self._latest: tuple[bytes, str, str, str] | None = None
+        self._version = 0
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def publish(self, path: Path) -> None:
+        data = path.read_bytes()
+        mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        with self._lock:
+            self._version += 1
+            self._latest = data, mime, path.name, f'"{self._version}"'
+
+    def __enter__(self) -> PhotoServer:
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def setup(self) -> None:
+                self.request.settimeout(5)
+                super().setup()
+
+            def do_GET(self) -> None:
+                try:
+                    path = urlsplit(self.path).path
+                    if path == "/":
+                        data, mime = PHOTO_PAGE.encode("utf-8"), "text/html; charset=utf-8"
+                        headers = {}
+                    elif path == "/latest":
+                        with owner._lock:
+                            latest = owner._latest
+                        if latest is None:
+                            self.send_error(503, "Waiting for first photo")
+                            return
+                        data, mime, name, etag = latest
+                        if self.headers.get("If-None-Match") == etag:
+                            self.send_response(304)
+                            self.send_header("ETag", etag)
+                            self.send_header("Cache-Control", "no-store")
+                            self.end_headers()
+                            return
+                        headers = {"ETag": etag, "X-Photo-Filename": quote(name, safe="")}
+                    else:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    for key, value in headers.items():
+                        self.send_header(key, value)
+                    self.end_headers()
+                    self.wfile.write(data)
+                except OSError:
+                    pass  # A disconnected browser must not stop photography.
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._server.daemon_threads = True
+        self.port = self._server.server_port
+        self._thread = threading.Thread(target=self._server.serve_forever,
+                                        kwargs={"poll_interval": 0.1}, daemon=True)
+        self._thread.start()
+        print(f"Fotky na PC: otevri http://IP_RASPBERRY:{self.port}/ ve stejne siti.", flush=True)
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
 
 
 def required_height(field_width: float, field_height: float, hfov: float,
@@ -86,7 +230,8 @@ def send_photo(output: Path, url: str, timeout: float = 3.0) -> None:
 
 
 def photograph_periodically(output: Path, *, interval: float = 10.0, delay: float = 0.0,
-                           send_url: str | None = None, count: int = 0) -> None:
+                           send_url: str | None = None, count: int = 0,
+                           on_photo: Callable[[Path], None] | None = None) -> None:
     """Keep one camera open; save unique frames on a monotonic schedule.
 
     count=0 runs until Ctrl+C. Slow cycles skip missed deadlines, rather than
@@ -107,7 +252,7 @@ def photograph_periodically(output: Path, *, interval: float = 10.0, delay: floa
         parsed = urlsplit(send_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("Cil odesilani musi byt platna http:// nebo https:// URL")
-    else:
+    elif on_photo is None:
         print("Odesilani neni nastavene: snimky se pouze ukladaji. Pro odesilani pouzij --send-url.", flush=True)
     options = [cv2.IMWRITE_JPEG_QUALITY, 100] if suffix in (".jpg", ".jpeg") else []
     with PiCamera(width=1296, height=972) as camera:
@@ -130,6 +275,8 @@ def photograph_periodically(output: Path, *, interval: float = 10.0, delay: floa
                     handle.write(encoded.tobytes())
                 captured += 1
                 print(f"Ulozeno: {path.resolve()}", flush=True)
+                if on_photo is not None:
+                    on_photo(path)
                 if send_url:
                     try:
                         send_photo(path, send_url, timeout=min(3.0, interval / 2))
@@ -153,6 +300,8 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=10, help="Interval snimku v sekundach (default: 10)")
     parser.add_argument("--count", type=int, default=0, help="Pocet fotek; 0 = az do Ctrl+C")
     parser.add_argument("--send-url", help="HTTP endpoint prijimajici POST s obrazkem")
+    parser.add_argument("--host", default="0.0.0.0", help="Adresa webu; default: vsechna sitova rozhrani")
+    parser.add_argument("--port", type=int, default=8000, help="Port pro fotky v prohlizeci (default: 8000)")
     parser.add_argument("--output", type=Path, default=Path("pole.png"),
                         help="Zaklad nazvu fotek; ke kazde se prida cas a poradove cislo")
     parser.add_argument("--plan-only", action="store_true", help="Pouze vypocitat vysku, neotevirat kameru")
@@ -165,8 +314,13 @@ def main() -> int:
         print("Sirka pole musi smerovat podel sirky obrazu. FOV je nutne overit pro konkretni kameru.")
         if args.plan_only:
             return 0
-        photograph_periodically(args.output, interval=args.interval, delay=args.delay,
-                               send_url=args.send_url, count=args.count)
+        with PhotoServer(args.host, args.port) as viewer:
+            photograph_periodically(args.output, interval=args.interval, delay=args.delay,
+                                   send_url=args.send_url, count=args.count, on_photo=viewer.publish)
+            if args.count:
+                print("Foceni dokonceno. Web zustava dostupny do Ctrl+C.", flush=True)
+                while True:
+                    time.sleep(1)
         return 0
     except KeyboardInterrupt:
         print("Foceni zruseno.")
