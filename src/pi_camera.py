@@ -5,7 +5,7 @@ import math
 
 
 class PiCamera:
-    def __init__(self, index=0, *, ev=None, width=640, height=480, tuning_file=None, saturation=None):
+    def __init__(self, index=0, *, ev=None, width=640, height=480, tuning_file=None):
         if width <= 0 or height <= 0:
             raise ValueError('Rozlišení musí být kladné.')
         self.size = (width, height)
@@ -14,10 +14,6 @@ class PiCamera:
         self.index = index
         self.ev = ev
         self.tuning_file = tuning_file
-        # Sytost barev v ISP (libcamera Saturation, výchozí 1.0): vyšší = červenější červená.
-        if saturation is not None and (not math.isfinite(saturation) or not 0 <= saturation <= 32):
-            raise ValueError('Sytost musí být v rozsahu 0 až 32.')
-        self.saturation = saturation
         self._camera = None
 
     def open(self):
@@ -45,13 +41,8 @@ class PiCamera:
             camera.configure(config)
             # Stejně jako red_tracker.py ponecháme výchozí řízení z profilu.
             # Expozici měníme pouze při explicitním --ev.
-            controls = {}
             if self.ev is not None:
-                controls.update({'AeEnable': True, 'ExposureValue': self.ev})
-            if self.saturation is not None:
-                controls['Saturation'] = self.saturation
-            if controls:
-                camera.set_controls(controls)
+                camera.set_controls({'AeEnable': True, 'ExposureValue': self.ev})
             camera.start()
             time.sleep(2)  # Ustálení automatické expozice před prvním snímkem.
             self._report(camera)
@@ -72,12 +63,6 @@ class PiCamera:
         print(f'Kamera: požadovaný profil {self.tuning_file or "systémový (bez NoIR)"} '
               f'(skutečný ukazuje řádek libcamery "Using tuning file"), '
               f'{self.size[0]}x{self.size[1]}, {colour}', file=sys.stderr)
-
-    def set_saturation(self, value):
-        """Změna sytosti za běhu (posuvník v --tune)."""
-        self.saturation = value
-        if self._camera is not None:
-            self._camera.set_controls({'Saturation': value})
 
     def read(self):
         if self._camera is None:

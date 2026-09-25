@@ -25,7 +25,6 @@ class Observation:
     measurement: Circle | None = None
     stage_ms: dict | None = None
     detector_mode: str = 'geometry'
-    red: dict | None = None     # režim red: geometry, exp_px, detection, mask (pro náhled jako red_tracker.py)
 
     @property
     def offset(self):
@@ -62,13 +61,10 @@ class Vision:
             state = self.tracker.update(candidates, lambda prediction: [])
             elapsed = (time.perf_counter()-started)*1000
             height, width = frame.shape[:2]
-            red = dict(geometry=self.detector.geometry, exp_px=self.detector.exp_px,
-                       detection=self.detector.last_detection, last_pos=self.detector.last_pos,
-                       thresholds=self.detector.thresholds)
             return Observation(candidates, f'{state.status} | red | {elapsed:.0f} ms', [],
                                state.confirmed, elapsed, state.target, state.measured,
                                (width, height), self.tracker.last_measurement,
-                               {'red_and_tracking': elapsed}, 'red', red)
+                               {'red_and_tracking': elapsed}, 'red')
         gray, edges = self.detector.prepare(frame)
         prepared = time.perf_counter()
         if self.previous_shape != frame.shape or self.previous_sensitivity != self.detector.sensitivity:
@@ -143,37 +139,7 @@ def _text(image, text, origin, color, scale):
     cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1)
 
 
-def annotate_red(image, observation, thresholds=None):
-    """Náhled jako red_tracker.py --show: červená i kulatá růžová přebarvená na čistě červenou."""
-    from .red_detector import red_and_pink_circle_masks
-    view = image.copy()
-    height, width = view.shape[:2]
-    preview_mask, _, _ = red_and_pink_circle_masks(view, **(thresholds or {}))
-    view[preview_mask != 0] = (0, 0, 255)
-    cv2.drawMarker(view, (width // 2, height // 2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
-    red = observation.red or {}
-    det, geometry = red.get('detection'), red.get('geometry')
-    if det is not None:
-        c = (int(det['x']), int(det['y']))
-        cv2.circle(view, c, max(12, int(red.get('exp_px') or 0)), (0, 255, 0), 2)
-        cv2.line(view, (width // 2, height // 2), c, (0, 255, 255), 1)
-    if geometry is not None:
-        cv2.drawContours(view, [geometry['contour']], -1, (255, 0, 255), 2)
-        for circle in geometry['circles']:
-            cc = (int(round(circle['center'][0])), int(round(circle['center'][1])))
-            cv2.circle(view, cc, max(3, int(round(circle['radius']))), (0, 255, 0), 2)
-    visible = len(geometry['circles']) if geometry is not None else 0
-    tilt = geometry['angle'] if geometry is not None else None
-    cv2.putText(view, observation.status.split(' | ')[0], (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-    cv2.putText(view, f'Viditelne kruhy: {visible}', (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    tilt_text = f'{tilt:+.1f}' if tilt is not None else 'N/A'
-    cv2.putText(view, f'Naklon objektu: {tilt_text} stupnu', (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    return view
-
-
 def annotate_observation(image, observation):
-    if observation.detector_mode == 'red' and observation.red is not None:
-        return annotate_red(image, observation, observation.red.get('thresholds'))
     output = image.copy()
     height, width = output.shape[:2]
     for rectangle in observation.rectangles:

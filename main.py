@@ -13,7 +13,6 @@ import numpy as np
 from src.camera import Camera
 from src.pi_camera import PiCamera
 from src.vision import Vision, annotate_observation
-from src.red_detector import GeometryLog
 from src.publisher import JSONPublisher, detection_record
 from src.target_lock import TargetLock
 from src.diagnostics import Diagnostics
@@ -35,14 +34,6 @@ def parse_args():
     parser.add_argument('--hough', action='store_true', help='Pomalá záloha pro přerušené kruhové hrany (pro porovnání).')
     parser.add_argument('--detector', choices=('geometry', 'red'), default='red',
                         help='red (výchozí) = červená tečka 1:1 jako red_tracker.py; geometry = kolečko v obdélníku.')
-    parser.add_argument('--saturation', type=float,
-                        help='Sytost barev CSI kamery 0-32 (libcamera Saturation, 1 = beze změny). '
-                             'Výchozí nastavení kamery jako red_tracker.py; např. 2 zvýrazní červenou.')
-    parser.add_argument('--redness-min', type=int, default=25, help='Práh R - max(G, B), výchozí 25 jako red_tracker.py.')
-    parser.add_argument('--red-fraction', type=float, default=0.35,
-                        help='Práh (R - max(G, B)) / R, výchozí 0.35; nižší přijme i matnou červenou.')
-    parser.add_argument('--r-min', type=int, default=50, help='Minimální R, výchozí 50.')
-    parser.add_argument('--tune', action='store_true', help='Posuvníky prahů červené a sytosti v okně (jako red_tracker --tune).')
     parser.add_argument('--altitude', type=float, default=20.0,
                         help='Výška nad zemí v m pro očekávanou velikost tečky (jako red_tracker.py 20 m); '
                              's --mavlink se použije relative_alt z ArduPilotu.')
@@ -76,12 +67,6 @@ def parse_args():
         parser.error('--tuning-file vyžaduje --picamera.')
     if args.hough and args.detector == 'red':
         parser.error('--hough je pouze pro --detector geometry.')
-    if args.saturation is not None and (not np.isfinite(args.saturation) or not 0 <= args.saturation <= 32):
-        parser.error('--saturation musí být v rozsahu 0 až 32.')
-    if not (0 <= args.redness_min <= 255 and 0 <= args.r_min <= 255 and 0 <= args.red_fraction <= 1):
-        parser.error('Prahy červené: --redness-min a --r-min 0-255, --red-fraction 0-1.')
-    if args.tune and (args.headless or args.detector != 'red'):
-        parser.error('--tune vyžaduje okno (bez --headless) a --detector red.')
     if not np.isfinite(args.altitude) or args.altitude <= 0:
         parser.error('--altitude musí být kladná výška v metrech.')
     if args.frames is not None and args.frames < 1:
@@ -105,35 +90,6 @@ def parse_args():
     if args.ev is not None and (not np.isfinite(args.ev) or not -8 <= args.ev <= 8):
         parser.error('--ev musí být v rozsahu -8 až 8.')
     return args
-
-
-class Tuner:
-    """Posuvníky prahů červené a sytosti kamery; změny vypíše jako parametry příkazu."""
-
-    def __init__(self, window, detector, camera):
-        self.window, self.detector = window, detector
-        self.camera = camera if hasattr(camera, 'set_saturation') else None
-        cv2.createTrackbar('REDNESS_MIN', window, detector.redness_min, 255, lambda _: None)
-        cv2.createTrackbar('R_MIN', window, detector.r_min, 255, lambda _: None)
-        cv2.createTrackbar('RED_FRACTION x100', window, round(detector.red_fraction_min * 100), 100, lambda _: None)
-        if self.camera is not None:
-            cv2.createTrackbar('SATURATION x10', window, round((self.camera.saturation or 1.0) * 10), 60, lambda _: None)
-        self.last = None
-
-    def update(self):
-        values = (cv2.getTrackbarPos('REDNESS_MIN', self.window), cv2.getTrackbarPos('R_MIN', self.window),
-                  cv2.getTrackbarPos('RED_FRACTION x100', self.window) / 100,
-                  cv2.getTrackbarPos('SATURATION x10', self.window) / 10 if self.camera is not None else None)
-        if values == self.last:
-            return
-        self.detector.redness_min, self.detector.r_min, self.detector.red_fraction_min = values[:3]
-        if self.camera is not None and (self.last is None or values[3] != self.last[3]):
-            self.camera.set_saturation(values[3])
-        self.last = values
-        command = f'--redness-min {values[0]} --r-min {values[1]} --red-fraction {values[2]:.2f}'
-        if values[3] is not None:
-            command += f' --saturation {values[3]:.1f}'
-        print(f'Ladění: {command}', file=sys.stderr)
 
 
 def current_altitude(telemetry, fallback):
@@ -183,7 +139,7 @@ def main() -> int:
                 camera = stack.enter_context(Camera(str(args.video)))
                 frame = camera.read()
             else:
-                device = PiCamera(args.picamera, ev=args.ev, saturation=args.saturation,
+                device = PiCamera(args.picamera, ev=args.ev,
                                   width=args.width, height=args.height,
                                   tuning_file=(None if args.tuning_file == 'none' else
                                                args.tuning_file or 'ov5647_noir.json')) if args.picamera is not None else Camera(args.camera)
@@ -203,8 +159,6 @@ def main() -> int:
                 return 0
             vision = Vision(mode=args.detector, expected_diameter=args.red_diameter_px)
             if args.detector == 'red':
-                vision.detector.redness_min, vision.detector.r_min = args.redness_min, args.r_min
-                vision.detector.red_fraction_min = args.red_fraction
                 vision.detector.altitude_source = lambda: current_altitude(telemetry, args.altitude)
                 if gimbal is not None:
                     vision.detector.gimbal_source = lambda: (gimbal.x, gimbal.y)
@@ -221,21 +175,14 @@ def main() -> int:
             show_edges = False
             if not args.headless:
                 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                tuner = Tuner(window_name, vision.detector, camera) if args.tune else None
                 window_created = True
                 print('Červené oblasti. E: maska, Q / Escape: konec.' if args.detector == 'red' else
                       'Kolečko v obdélníku. 1/2/3: citlivost, B: 1.5, E: hrany, Q / Escape: konec.', file=sys.stderr)
             observation = None
-            geometry_log = GeometryLog() if args.detector == 'red' else None
             while True:
                 if observation is None or camera is not None:
                     observation = vision.observe(frame)
                     sequence += 1
-                    if geometry_log is not None:
-                        message = geometry_log.update(observation.red['geometry'], observation.red['last_pos'],
-                                                      observation.frame_size, time.time())
-                        if message:
-                            print(message, file=sys.stderr)  # stdout patří JSON Lines
                     record = detection_record(observation, sequence=sequence,
                                               received_at=received_at, source=source_name)
                     record['telemetry'] = telemetry.snapshot() if telemetry is not None else None
@@ -263,8 +210,6 @@ def main() -> int:
                 image = annotate_observation(background, observation)
                 cv2.imshow(window_name, image)
                 key = cv2.waitKey(1) & 0xFF
-                if tuner is not None:
-                    tuner.update()
                 if key in (ord('1'), ord('2'), ord('3')):
                     vision.detector.sensitivity = int(chr(key))
                 if key in (ord('b'), ord('B')):
