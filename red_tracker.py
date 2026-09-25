@@ -83,6 +83,18 @@ RG_MIN = 28             # R - G > this ...
 RG_FRAC = 0.22          # ... and R - G > this fraction of R (brightness independent)
 BG_TOL = 22             # B >= G - this   (red: B~G, pink: B>G; orange/brown/wood: B<<G -> rejected)
 RB_TOL = 40             # R >= B - this   (rejects blue/purple)
+# adaptive colour (v5): for washed-out / NoIR pictures where the disc is only faintly pink.
+# score = (R - G) + PINK_B_WEIGHT * max(0, B - G), after software white balance.
+# A pixel counts if its score is clearly above the rest of the picture.
+ADAPTIVE_COLOUR = True
+PINK_B_WEIGHT = 0.5
+SCORE_MIN = 12.0            # never accept below this score
+SCORE_K_STD = 2.5           # ... and above  mean + K * std  of the whole picture
+SCORE_TRACK_FRAC = 0.55     # while tracking: threshold = this x the disc's own score
+MIN_SCORE_CONTRAST = 10.0   # disc must score this much higher than the ring around it
+WB_SMOOTH = 0.9             # EMA of the white-balance gains
+# camera image controls (Picamera2): more saturation/contrast = pinker disc
+CAM_CONTROLS = {"Saturation": 1.8, "Contrast": 1.3, "Sharpness": 1.5}
 
 # --- target shape ---
 MIN_AREA_PX = 3
@@ -260,6 +272,10 @@ class Camera:
                 buffer_count=2)
             self.cam.configure(cfg)
             self.cam.start()
+            try:
+                self.cam.set_controls(CAM_CONTROLS)
+            except Exception as e:
+                print(f"[camera] could not set {CAM_CONTROLS}: {e}")
             time.sleep(1.5)
             self.kind = "picamera2"
         except Exception as e:
@@ -403,6 +419,7 @@ class SimCamera:
         # TRUE hardware: physical = hw_mapping @ raw servo command (unknown to the tracker)
         self.hw = np.eye(2) if hw_mapping is None else np.asarray(hw_mapping, float)
         self.tilt, self.pink, self.glare = tilt, pink, glare
+        self.washed = False
         rng = np.random.default_rng(1)
         blotch = cv2.resize(rng.normal(0, 14, (CAPTURE_H // 40, CAPTURE_W // 40)), (CAPTURE_W, CAPTURE_H))
         base = 145 + blotch + rng.normal(0, 7, (CAPTURE_H, CAPTURE_W))
@@ -454,6 +471,8 @@ class SimCamera:
                                 for a in t], st, ang)
             self._fill(img, gl, (250, 250, 250))
         img = cv2.GaussianBlur(img, (3, 3), 0)
+        if self.washed:          # like the real NoIR feed: low contrast, faint pink
+            img = cv2.addWeighted(img, 0.35, np.full_like(img, (175, 165, 160)), 0.65, 0)
         return img
 
     def close(self):
@@ -461,6 +480,44 @@ class SimCamera:
 
 
 # --------------------------- detection ---------------------------
+class ColourModel:
+    """Scene statistics for the adaptive colour score, updated once per full frame."""
+
+    def __init__(self):
+        self.gains = np.ones(3, np.float32)
+        self.thr = SCORE_MIN
+        self.target_score = None        # learned score of the tracked disc (EMA)
+
+    def update(self, frame):
+        small = cv2.resize(frame, (160, 120), interpolation=cv2.INTER_AREA).astype(np.float32)
+        means = small.reshape(-1, 3).mean(axis=0) + 1e-3
+        g = np.clip(means.mean() / means, 0.6, 1.6).astype(np.float32)
+        self.gains = WB_SMOOTH * self.gains + (1 - WB_SMOOTH) * g
+        s = self.score(small)
+        self.thr = max(SCORE_MIN, float(s.mean() + SCORE_K_STD * s.std()))
+
+    def score(self, img):
+        f = img.astype(np.float32) * self.gains
+        b, g, r = f[:, :, 0], f[:, :, 1], f[:, :, 2]
+        return (r - g) + PINK_B_WEIGHT * np.maximum(0.0, b - g)
+
+    def threshold(self, tracking):
+        if tracking and self.target_score is not None:
+            return max(SCORE_MIN, SCORE_TRACK_FRAC * self.target_score)
+        return self.thr
+
+    def learn(self, score):
+        if score is not None:
+            self.target_score = score if self.target_score is None else \
+                0.8 * self.target_score + 0.2 * score
+
+    def forget(self):
+        self.target_score = None
+
+
+COLOUR = ColourModel()
+
+
 def colour_mask(img):
     """Binary mask of red OR NoIR-pink pixels (see CONFIG for the rule)."""
     b, g, r = img[:, :, 0], img[:, :, 1], img[:, :, 2]
@@ -598,6 +655,12 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
     pscale = max(ROI_HALF_MIN * scale, 3.0 * ref)
 
     mask = colour_mask(img)
+    score = None
+    if ADAPTIVE_COLOUR:
+        score = COLOUR.score(img)
+        thr = COLOUR.threshold(tracking=roi is not None or shape_fallback)
+        mask |= ((score > thr).astype(np.uint8) * 255)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL_3)   # drop speckle
     k = 5 if ref > 40 else 3                       # bridge small glare gaps on big discs
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -622,7 +685,24 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
             cover = cv2.countNonZero(comp & c["sil"]) / float(max(1, cv2.countNonZero(c["sil"])))
             if cover < MIN_COLOUR_COVERAGE:
                 continue
+        c["score"] = None
+        if score is not None:
+            # the disc must stand out from its immediate surroundings (paper / ground)
+            inside = score[by:by + bh, bx:bx + bw][comp > 0]
+            pad = max(3, int(0.35 * max(bw, bh)))
+            ry0, ry1 = max(0, by - pad), min(score.shape[0], by + bh + pad)
+            rx0, rx1 = max(0, bx - pad), min(score.shape[1], bx + bw + pad)
+            ring = np.ones((ry1 - ry0, rx1 - rx0), bool)
+            ring[by - ry0:by - ry0 + bh, bx - rx0:bx - rx0 + bw] = False
+            if inside.size and ring.any():
+                s_in = float(np.median(inside))
+                contrast = s_in - float(np.median(score[ry0:ry1, rx0:rx1][ring]))
+                if contrast < MIN_SCORE_CONTRAST:
+                    continue
+                c["score"] = s_in
         cost = _score(c, ref, size_range, pref, pscale)
+        if cost is not None and c["score"] is not None and COLOUR.target_score:
+            cost += 0.5 * abs(math.log(max(c["score"], 1.0) / max(COLOUR.target_score, 1.0)))
         if cost is not None and cost < best_cost:
             best_cost, best, c["source"] = cost, c, "colour"
 
@@ -630,7 +710,9 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
     # - in TRACK, keep the target alive when colour is lost by glare/shadow;
     # - in SEARCH/bench, allow a clearly round 200 mm surface to be acquired
     #   even when the NoIR colour rendering is poor.
-    use_shape = shape_fallback or (roi is None)
+    # (shape-only is NOT used for the first acquisition any more: it made the tracker
+    #  lock on lamps and other round things when the colour was weak)
+    use_shape = shape_fallback and pref is not None
     if best is None and use_shape:
         shape_range = (0.45, 1.8) if (shape_fallback and pref is not None) else size_range
         for cost, c in _shape_candidates(
@@ -647,7 +729,7 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
     return dict(x=x0 + best["cx"] * inv, y=y0 + best["cy"] * inv,
                 w=best["major"] * inv, h=best["minor"] * inv,
                 tilt=math.degrees(math.acos(min(1.0, best["minor"] / max(best["major"], 1e-6)))),
-                angle=best["angle"], source=best["source"]), mask
+                angle=best["angle"], source=best["source"], score=best.get("score")), mask
 
 
 def normalize_rect_angle(rect):
@@ -1008,6 +1090,7 @@ def run(args):
         hw = np.array([[0.0, sy * k], [sx * k, 0.0]]) if args.sim_swap else np.diag([sx * k, sy * k])
         cam = SimCamera(gimbal, tuple(args.sim), tilt=args.tilt, pink=args.pink, glare=args.glare,
                         hw_mapping=hw)
+        cam.washed = args.washed
     else:
         cam = Camera()
     if args.tune:
@@ -1051,11 +1134,13 @@ def run(args):
         tgt_abs, last_abs, prev_err, grow_count, limit_count = None, None, None, 0, 0
         return P is not None
 
+    show_mask = False
     try:
         while True:
             frame = cam.read()
             if frame is None:
                 continue
+            COLOUR.update(frame)
             now = time.time()
             t_cap = now - FRAME_LATENCY_S
             st = get_drone_state()
@@ -1110,6 +1195,7 @@ def run(args):
                             if not args.no_autocal and cal_attempts < 3:
                                 need_cal = True
                         state, estimates, tgt_abs = "SEARCH", deque(maxlen=60), None
+                        COLOUR.forget()
                         last_abs, prev_err, grow_count, limit_count = None, None, 0, 0
                         gimbal.move_to(*grid[gi])      # go back to the search aim point
                         settle_until = now + SETTLE_S
@@ -1120,6 +1206,7 @@ def run(args):
                 if state == "SEARCH":
                     state = "TRACK"
                 last_pos, misses = (det["x"], det["y"]), 0
+                COLOUR.learn(det.get("score"))
                 last_size = det["w"] if last_size is None else 0.6 * last_size + 0.4 * det["w"]
                 dx, dy = det["x"] - W / 2, det["y"] - H / 2
                 ex, ey = pixel_error_to_angles(dx, dy)
@@ -1238,6 +1325,12 @@ def run(args):
             if args.show:
                 ds = float(DISPLAY_SCALE)
                 view = cv2.resize(frame, None, fx=ds, fy=ds, interpolation=cv2.INTER_AREA)
+                if show_mask:     # 'm': what the colour detector sees (white = counts as target)
+                    s = COLOUR.score(view)
+                    thr = COLOUR.threshold(tracking=state != "SEARCH")
+                    g8 = np.clip(s * (128.0 / max(thr, 1.0)), 0, 255).astype(np.uint8)
+                    view = cv2.cvtColor(g8, cv2.COLOR_GRAY2BGR)
+                    view[s > thr] = (255, 255, 255)
                 vH, vW = view.shape[:2]
                 colour = {"LOCKED": (0, 255, 0), "TRACK": (0, 255, 255)}.get(state, (200, 200, 200))
                 cv2.drawMarker(view, (vW // 2, vH // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
@@ -1275,9 +1368,16 @@ def run(args):
                     cv2.putText(view, f"disc tilt {det['tilt']:.0f} deg [{det['source']}]", (10, 74),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 cv2.putText(view, f"FPS: {fps:.1f}", (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.imshow("tracker (q = quit)", view)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                tscore = f"{COLOUR.target_score:.0f}" if COLOUR.target_score else "-"
+                cv2.putText(view, f"colour thr {COLOUR.threshold(state != 'SEARCH'):.0f}  disc {tscore}"
+                            f"  ('m' = mask view)", (10, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (255, 255, 255), 1)
+                cv2.imshow("tracker (q = quit, m = mask)", view)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
                     break
+                if key == ord("m"):
+                    show_mask = not show_mask
             if args.seconds and now - t_start > args.seconds:
                 break
     except KeyboardInterrupt:
@@ -1311,6 +1411,7 @@ if __name__ == "__main__":
     ap.add_argument("--swap-axes", action="store_true", help="manual: X and Y servos swapped")
     ap.add_argument("--invert-x", action="store_true", help="manual: servo on X_PIN turns the wrong way")
     ap.add_argument("--invert-y", action="store_true", help="manual: servo on Y_PIN turns the wrong way")
+    ap.add_argument("--washed", action="store_true", help="sim: washed-out low-colour picture")
     ap.add_argument("--sim-swap", action="store_true", help="sim: pretend the servos are swapped")
     ap.add_argument("--sim-invert-x", action="store_true", help="sim: pretend the X servo is reversed")
     ap.add_argument("--sim-invert-y", action="store_true", help="sim: pretend the Y servo is reversed")
