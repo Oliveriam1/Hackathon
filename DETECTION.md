@@ -109,3 +109,20 @@ Lokální orientační porovnání na syntetickém snímku 1296×972 s šedými 
 a jednou červenou tečkou (22 měření po zahřátí): plné hledání původního detektoru
 medián 25.12 ms, nového 18.23 ms; p95 27.82 vs 19.18 ms. Původní algoritmus
 byl načten z tehdejšího HEAD. Výsledek není měřením Raspberry Pi ani přesnosti v poli.
+
+### Platnost dat a identifikace běhu
+
+Výstup `--drone-data` navíc obsahuje `session_id` (nové UUID při každém spuštění),
+`tracking_state`, `invalid_reason`, `camera_error_px`, `max_measurement_age_ms`,
+`remaining_validity_ms` a `live_control_input_valid`.
+
+Dvojice session_id/sequence rozlišuje restart od starého nebo opakovaného záznamu.
+`live_control_input_valid` může být true pouze pro čerstvé potvrzené měření ze zdroje
+camera; video a fotografie nejsou živý řídicí vstup. Tento příznak stále neznamená
+připravenost k letu (`flight_ready` zůstává false).
+
+Zbývající platnost se počítá při vytvoření zprávy, nikoliv při jejím přijetí.
+Příjemce musí započítat prodlevu přenosu a vlastní čekání; nesmí po výpadku proudu
+zpráv trvale používat poslední platný bod. Bez časové synchronizace nelze z času
+příjmu na jiném počítači zaručit stáří snímku. Čas expozice stále není dostupný.
+Při neplatném měření jsou poloha i obě odchylky null a zbývající platnost je 0.

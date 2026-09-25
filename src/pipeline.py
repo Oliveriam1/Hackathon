@@ -1,5 +1,6 @@
 """Zpracování snímku a sestavení dat; nezávislé na GUI a zdroji obrazu."""
 import time
+from uuid import uuid4
 from .vision import Vision
 from .target_lock import TargetLock
 from .publisher import detection_record
@@ -37,6 +38,7 @@ class DetectionPipeline:
         self.target_lock = TargetLock()
         self.mission = Mission()
         self.sequence = 0
+        self.session_id = str(uuid4())
 
     def process(self, frame, *, received_at, sample_time, source):
         observation = self.vision.observe(frame, sample_time=sample_time)
@@ -47,6 +49,7 @@ class DetectionPipeline:
         record['visual_lock'] = self.target_lock.update(observation, sample_time=sample_time,
                                                       now=time.monotonic())
         record['autonomy'] = self.mission.snapshot()
-        record['drone_data'] = drone_record(record)
+        record['drone_data'] = drone_record(record, session_id=self.session_id,
+                                          max_age_s=self.target_lock.max_age_s)
         return observation, record
 
