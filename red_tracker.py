@@ -20,8 +20,7 @@ Detection (v3)
   * While tracking, the size filter follows the disc's own last size, so it keeps working
     when the disc gets closer/further or tilts. The altitude-based size is used only to
     find it the first time.
-  * If colour briefly fails (glare, shadow) a shape-only check near the last position
-    keeps the track alive.
+  * Edge-based recovery near the last position still requires target colour.
 
 Control (v3)
   * Latency-compensated: each frame's error is added to the gimbal angle AT THE TIME THE
@@ -39,7 +38,7 @@ Install on the Pi:
 
 Run:
     python3 red_tracker.py                      # full system (drone)
-    python3 red_tracker.py --bench 1.5 --show   # desk test: printed disc ~1.5 m from camera
+    python3 red_tracker.py --bench 1.5 --show --debug  # desk test, servos held at 0/0
     python3 red_tracker.py --bench 1.5 --show --no-servo   # desk test, gimbal not moved
     python3 red_tracker.py --tune               # colour sliders (desktop / VNC)
     python3 red_tracker.py --sim 52 6           # simulation, no hardware
@@ -74,7 +73,7 @@ RB_TOL = 40             # R >= B - this   (rejects blue/purple)
 MIN_AREA_PX = 3
 SMALL_BLOB_PX = 10          # below this size only a basic aspect check is possible
 MAX_ASPECT = 4.5            # ellipse major/minor; 4.5 = disc tilted ~77 deg
-MIN_ELLIPSE_IOU = 0.72      # filled silhouette vs its fitted ellipse
+MIN_ELLIPSE_IOU = 0.90      # full silhouette union; rectangles score about 0.82
 MIN_SOLIDITY = 0.85
 MIN_COLOUR_COVERAGE = 0.45  # coloured pixels / silhouette (glare holes allowed)
 SEARCH_SIZE_RATIO = (0.3, 3.0)   # vs altitude-based expected size (first detection)
@@ -177,7 +176,12 @@ def slant_range(ax, ay, h):
 
 
 def expected_diameter_px(ax, ay, h):
-    return F_X * TARGET_DIAMETER_M / slant_range(ax, ay, h)
+    """Expected major diameter in original pixels; h is AGL (bench: axial distance).
+
+    At 0/0 and 1.5 m a 0.20 m disc spans about 170 x 173 pixels.
+    detect() scales both this reference and the image by DETECT_FULL_SCALE.
+    """
+    return max(F_X, F_Y) * TARGET_DIAMETER_M / slant_range(ax, ay, h)
 
 
 def pixel_error_to_angles(dx, dy):
@@ -221,7 +225,9 @@ class Camera:
             tuning = Picamera2.load_tuning_file(TUNING_FILE) if TUNING_FILE else None
             self.cam = Picamera2(tuning=tuning)
             cfg = self.cam.create_video_configuration(
-                main={"size": (CAPTURE_W, CAPTURE_H), "format": "RGB888"},  # BGR order in numpy
+                # Picamera2 manual: RGB888 arrays contain [B,G,R]; no channel swap.
+                # https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf
+                main={"size": (CAPTURE_W, CAPTURE_H), "format": "RGB888"},
                 transform=Transform(hflip=CAM_ROTATE_180, vflip=CAM_ROTATE_180),
                 buffer_count=2)
             self.cam.configure(cfg)
@@ -249,11 +255,12 @@ class Gimbal:
     """x, y = commanded PHYSICAL angles (deg): x = right, y = forward, 0/0 = straight down.
     Keeps a short command history so the controller can ask where the gimbal actually
     pointed when a given frame was captured (servo + camera latency compensation).
-    frozen=True (--no-servo): angles never change, so the measured error stays honest."""
+    frozen=True (--no-servo): no hardware writes. hold_zero=True (--bench):
+    command calibrated neutral once, then keep both angles at 0/0."""
 
-    def __init__(self, hardware=True, frozen=False):
+    def __init__(self, hardware=True, frozen=False, hold_zero=False):
         self.x = self.y = 0.0
-        self.frozen = frozen
+        self.frozen = frozen or hold_zero
         self.pi = None
         self.hist = deque(maxlen=200)
         self.hist.append((0.0, 0.0, 0.0))
@@ -380,11 +387,11 @@ def colour_mask(img):
     return m
 
 
-def _ellipse_check(contour, bw, bh, ox, oy):
+def _ellipse_check(contour, bw, bh, ox, oy, diagnostics=None):
     """Shape test on a closed contour (coordinates relative to ox, oy).
     Returns dict(major, minor, cx, cy, iou, angle, sil) or None if it isn't ellipse-like."""
     area = abs(cv2.contourArea(contour))
-    if max(bw, bh) < SMALL_BLOB_PX or len(contour) < 5:
+    if max(bw, bh) < SMALL_BLOB_PX:
         # tiny blob: only size/aspect are meaningful
         major, minor = float(max(bw, bh)), float(max(1, min(bw, bh)))
         if major / minor > MAX_ASPECT:
@@ -396,6 +403,9 @@ def _ellipse_check(contour, bw, bh, ox, oy):
             cx, cy = bw / 2.0, bh / 2.0
         return dict(major=major, minor=minor, cx=cx + ox, cy=cy + oy, iou=0.85, angle=0.0, sil=None)
 
+    if len(contour) < 5:
+        return None  # A large four-vertex rectangle is not a tiny unresolved disc.
+
     (ex, ey), (ew, eh), ang = cv2.fitEllipse(contour)
     major, minor = max(ew, eh), min(ew, eh)
     major_angle = ang + 90.0 if ew < eh else ang     # orientation of the major axis
@@ -406,10 +416,22 @@ def _ellipse_check(contour, bw, bh, ox, oy):
         return None
     sil = np.zeros((bh, bw), np.uint8)
     cv2.drawContours(sil, [contour], -1, 255, cv2.FILLED)          # fills glare holes
-    ell = np.zeros((bh, bw), np.uint8)
-    cv2.ellipse(ell, ((ex, ey), (ew, eh), ang), 255, cv2.FILLED)
-    union = cv2.countNonZero(sil | ell)
-    iou = cv2.countNonZero(sil & ell) / float(union) if union else 0.0
+    # Include the COMPLETE fitted ellipse. Clipping it to the blob's bounding
+    # box hid the oversized ellipse outside rectangular blobs and inflated IoU.
+    theta = math.radians(ang)
+    rx = math.hypot(ew / 2 * math.cos(theta), eh / 2 * math.sin(theta))
+    ry = math.hypot(ew / 2 * math.sin(theta), eh / 2 * math.cos(theta))
+    left, top = min(0, math.floor(ex - rx) - 1), min(0, math.floor(ey - ry) - 1)
+    right, bottom = max(bw, math.ceil(ex + rx) + 2), max(bh, math.ceil(ey + ry) + 2)
+    if right - left > 3 * bw or bottom - top > 3 * bh:
+        return None  # Degenerate fit; avoid an unbounded temporary allocation.
+    ell = np.zeros((bottom - top, right - left), np.uint8)
+    cv2.ellipse(ell, ((ex - left, ey - top), (ew, eh), ang), 255, cv2.FILLED)
+    intersection = cv2.countNonZero(sil & ell[-top:bh - top, -left:bw - left])
+    union = cv2.countNonZero(sil) + cv2.countNonZero(ell) - intersection
+    iou = intersection / float(union) if union else 0.0
+    if diagnostics is not None:
+        diagnostics["best_shape"] = max(diagnostics.get("best_shape", 0.0), iou)
     if iou < MIN_ELLIPSE_IOU:
         return None
     return dict(major=major, minor=minor, cx=ex + ox, cy=ey + oy, iou=iou, angle=major_angle, sil=sil)
@@ -425,7 +447,8 @@ def _score(c, size_ref, size_range, prefer, prefer_scale):
     return cost
 
 
-def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO, shape_fallback=False):
+def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO, shape_fallback=False,
+           diagnostics=None):
     """Find the red/pink disc (circle or tilted ellipse).
 
     size_ref   : expected major-axis size in px (altitude-based in SEARCH, last size in TRACK)
@@ -450,6 +473,12 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
     k = 5 if ref > 40 else 3                       # bridge small glare gaps on big discs
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if diagnostics is not None:
+        diagnostics["blobs"] = diagnostics.get("blobs", 0) + n - 1
+
+    def rejected(stage):
+        if diagnostics is not None:
+            diagnostics[stage] = diagnostics.get(stage, 0) + 1
 
     best, best_cost = None, float("inf")
     for i in range(1, n):
@@ -458,24 +487,33 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
             continue
         major_bb = max(bw, bh)
         if major_bb < size_range[0] * ref * 0.7 or min(bw, bh) > size_range[1] * ref * 1.3:
+            rejected("reject_size")
             continue                               # cheap size pre-filter
         comp = (labels[by:by + bh, bx:bx + bw] == i).astype(np.uint8) * 255
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not cnts:
             continue
         cnt = max(cnts, key=cv2.contourArea)
-        c = _ellipse_check(cnt, bw, bh, bx, by)
+        c = _ellipse_check(cnt, bw, bh, bx, by, diagnostics)
         if c is None:
+            rejected("reject_shape")
             continue
+        cover = 1.0
         if c["sil"] is not None:
             cover = cv2.countNonZero(comp & c["sil"]) / float(max(1, cv2.countNonZero(c["sil"])))
             if cover < MIN_COLOUR_COVERAGE:
+                rejected("reject_colour")
                 continue
+        c["coverage"] = cover
         cost = _score(c, ref, size_range, pref, pscale)
+        if cost is None:
+            rejected("reject_size")
+        else:
+            rejected("detected_candidates")
         if cost is not None and cost < best_cost:
             best_cost, best, c["source"] = cost, c, "colour"
 
-    # Shape-only fallback near the last position (glare/shadow can kill colour for a moment).
+    # Edge recovery may bridge glare, but must still satisfy the colour rule.
     if best is None and shape_fallback and pref is not None:
         gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0)
         edges = cv2.dilate(cv2.Canny(gray, 40, 120), MORPH_KERNEL_3)
@@ -485,20 +523,40 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
             if max(bw, bh) < max(SMALL_BLOB_PX, 0.5 * ref) or max(bw, bh) > 2.0 * ref:
                 continue
             local = cnt - np.array([bx, by])
-            c = _ellipse_check(local, bw, bh, bx, by)
+            c = _ellipse_check(local, bw, bh, bx, by, diagnostics)
             if c is None or math.hypot(c["cx"] - pref[0], c["cy"] - pref[1]) > 1.0 * ref:
                 continue
+            cover = cv2.countNonZero(mask[by:by + bh, bx:bx + bw] & c["sil"]) / float(max(1, cv2.countNonZero(c["sil"])))
+            if cover < MIN_COLOUR_COVERAGE:
+                rejected("reject_colour")
+                continue
+            c["coverage"] = cover
             cost = _score(c, ref, (0.6, 1.6), pref, pscale)
+            if cost is None:
+                rejected("reject_size")
+            else:
+                rejected("detected_candidates")
             if cost is not None and cost < best_cost:
                 best_cost, best, c["source"] = cost, c, "shape"
 
     if best is None:
         return None, mask
     inv = 1.0 / scale
+    if diagnostics is not None:
+        diagnostics.update(best_size=best["major"] * inv, best_shape=best["iou"], best_colour=best["coverage"])
     return dict(x=x0 + best["cx"] * inv, y=y0 + best["cy"] * inv,
                 w=best["major"] * inv, h=best["minor"] * inv,
                 tilt=math.degrees(math.acos(min(1.0, best["minor"] / max(best["major"], 1e-6)))),
                 angle=best["angle"], source=best["source"]), mask
+
+
+def fill_confirmed_target(view, det, scale):
+    """Only annotate the display copy, and only the selected detector result."""
+    if det is not None:
+        center = (int(round(det["x"] * scale)), int(round(det["y"] * scale)))
+        axes = (max(1, int(round(det["w"] * scale / 2))),
+                max(1, int(round(det["h"] * scale / 2))))
+        cv2.ellipse(view, center, axes, det["angle"], 0, 360, (0, 0, 255), cv2.FILLED)
 
 
 def normalize_rect_angle(rect):
@@ -687,8 +745,8 @@ def run(args):
     global DRONE_ALT_M
     if args.bench:
         DRONE_ALT_M = args.bench            # camera-to-target distance on the desk
-    frozen = args.no_servo
-    gimbal = Gimbal(hardware=not args.sim, frozen=frozen)
+    frozen = args.no_servo or bool(args.bench)
+    gimbal = Gimbal(hardware=not args.sim, frozen=args.no_servo, hold_zero=bool(args.bench))
     if args.sim:
         cam = SimCamera(gimbal, tuple(args.sim), tilt=args.tilt, pink=args.pink, glare=args.glare)
     else:
@@ -715,6 +773,7 @@ def run(args):
     result = None
     last_logged_circle_count, last_logged_angle, last_event_log_time = None, None, 0.0
     geometry, geometry_frame_counter = None, 0
+    t_debug = -math.inf
 
     try:
         while True:
@@ -727,11 +786,12 @@ def run(args):
             H, W = frame.shape[:2]
             gx, gy = (gimbal.x, gimbal.y) if frozen else gimbal.angle_at(t_cap)
             exp_px = expected_diameter_px(gx, gy, st["alt"])
+            diagnostics = {} if getattr(args, "debug", False) and now - t_debug >= 0.5 else None
             det, line = None, ""
 
             if state == "SEARCH":
                 if now >= settle_until:
-                    det, _ = detect(frame, exp_px, size_range=SEARCH_SIZE_RATIO)
+                    det, _ = detect(frame, exp_px, size_range=SEARCH_SIZE_RATIO, diagnostics=diagnostics)
                     if det:
                         state, misses, centred, off_count = "TRACK", 0, 0, 0
                         last_size, tgt_abs = det["w"], None
@@ -747,9 +807,9 @@ def run(args):
                 roi = (int(max(0, px - half)), int(max(0, py - half)),
                        int(min(W, px + half)), int(min(H, py + half)))
                 det, _ = detect(frame, last_size, roi=roi, prefer=last_pos,
-                                size_range=TRACK_SIZE_RATIO, shape_fallback=True)
+                                size_range=TRACK_SIZE_RATIO, shape_fallback=True, diagnostics=diagnostics)
                 if det is None and misses >= 2:
-                    det, _ = detect(frame, last_size, prefer=last_pos, size_range=TRACK_SIZE_RATIO)
+                    det, _ = detect(frame, last_size, prefer=last_pos, size_range=TRACK_SIZE_RATIO, diagnostics=diagnostics)
                 if det is None:
                     misses += 1
                     if misses > COAST_FRAMES:
@@ -849,6 +909,21 @@ def run(args):
                         last_logged_angle = object_angle
                     last_event_log_time = now
 
+            if diagnostics is not None:
+                def metric(name):
+                    value = diagnostics.get(name)
+                    return "N/A" if value is None else f"{value:.2f}"
+                print(f"DEBUG: expected_px={exp_px:.1f} blobs={diagnostics.get('blobs', 0)} "
+                      f"detected_candidates={diagnostics.get('detected_candidates', 0)} "
+                      f"best_size={metric('best_size')} best_shape={metric('best_shape')} "
+                      f"best_colour={metric('best_colour')} "
+                      f"reject_size={diagnostics.get('reject_size', 0)} "
+                      f"reject_shape={diagnostics.get('reject_shape', 0)} "
+                      f"reject_colour={diagnostics.get('reject_colour', 0)} "
+                      f"state={state} phase={'detect' if 'blobs' in diagnostics else 'settling'} "
+                      f"frame={W}x{H} BGR")
+                t_debug = now
+
             dt, t_prev = now - t_prev, now
             if dt > 0:
                 fps = 0.9 * fps + 0.1 / dt
@@ -864,8 +939,6 @@ def run(args):
                 cv2.drawMarker(view, (vW // 2, vH // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
                 if det is not None:
                     c = (int(round(det["x"] * ds)), int(round(det["y"] * ds)))
-                    axes = (max(3, int(det["w"] * ds / 2)), max(2, int(det["h"] * ds / 2)))
-                    cv2.ellipse(view, c, axes, det["angle"], 0, 360, colour, 2)
                     cv2.line(view, (vW // 2, vH // 2), c, colour, 1)
                 if geometry is not None:
                     q = np.rint(geometry["contour"].astype(np.float32) * ds).astype(np.int32)
@@ -879,6 +952,7 @@ def run(args):
                     cv2.putText(view, f"disc tilt {det['tilt']:.0f} deg [{det['source']}]", (10, 74),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 cv2.putText(view, f"FPS: {fps:.1f}", (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                fill_confirmed_target(view, det, ds)
                 cv2.imshow("tracker (q = quit)", view)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -898,9 +972,10 @@ def run(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--show", action="store_true", help="preview window")
+    ap.add_argument("--debug", action="store_true", help="detection diagnostics at most twice per second")
     ap.add_argument("--no-servo", action="store_true", help="don't move the gimbal (detection test)")
     ap.add_argument("--bench", type=float, default=0, metavar="DIST_M",
-                    help="desk test: camera-to-target distance in metres, no search sweep")
+                    help="desk test: camera-to-target distance in metres, servos held at 0/0")
     ap.add_argument("--geometry", action="store_true", help="print quad/circle (Naklon) info without --show")
     ap.add_argument("--tune", action="store_true", help="colour threshold sliders")
     ap.add_argument("--sim", nargs=2, type=float, metavar=("X", "Y"), help="simulate, target at field X, Y")
