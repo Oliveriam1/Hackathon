@@ -536,7 +536,7 @@ def run(args):
             frame = cam.read()
             if frame is None:
                 continue
-                now = time.time()
+            now = time.time()
             st = get_drone_state()
             H, W = frame.shape[:2]
             exp_px = expected_diameter_px(gimbal.x, gimbal.y, st["alt"])
