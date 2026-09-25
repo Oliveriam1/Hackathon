@@ -260,7 +260,7 @@ def send_photo(output: Path, url: str, timeout: float = 3.0) -> None:
             raise RuntimeError(f"Prijemce vratil HTTP {response.status}")
 
 
-def photograph_periodically(output: Path, *, interval: float = 10.0, delay: float = 0.0,
+def photograph_periodically(output: Path, *, interval: float = 5.0, delay: float = 0.0,
                            send_url: str | None = None, count: int = 0,
                            on_photo: Callable[[Path], None] | None = None) -> None:
     """Keep one camera open; save unique frames on a monotonic schedule.
@@ -328,7 +328,7 @@ def main() -> int:
     parser.add_argument("--vfov", type=float, default=41, help="Vertikalni FOV ve stupnich (nominalne 41)")
     parser.add_argument("--margin", type=float, default=1.1, help="Rezerva pokryti (default: 1.1 = 10 %%)")
     parser.add_argument("--delay", type=float, default=0, help="Sekundy do prvni fotky po otevreni kamery")
-    parser.add_argument("--interval", type=float, default=10, help="Interval snimku v sekundach (default: 10)")
+    parser.add_argument("--interval", type=float, default=5, help="Interval snimku v sekundach (default: 10)")
     parser.add_argument("--count", type=int, default=0, help="Pocet fotek; 0 = az do Ctrl+C")
     parser.add_argument("--send-url", help="HTTP endpoint prijimajici POST s obrazkem")
     parser.add_argument("--host", default="0.0.0.0", help="Adresa webu; default: vsechna sitova rozhrani")
