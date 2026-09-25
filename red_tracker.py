@@ -69,20 +69,26 @@ MIN_AREA_PX = 3         # at 20 m the disc is only a few px, keep this small
 # Physical target is 200 mm, but its pixel diameter is computed dynamically
 # from camera FOV + current slant range. These are ratios to that expected
 # pixel diameter, never absolute pixel sizes.
-TARGET_SIZE_RATIO = (0.35, 2.20)
+TARGET_SIZE_RATIO = (0.35, 2.80)
 # A circle seen obliquely becomes an ellipse. The major/minor ratio is allowed
 # to be large enough for strong perspective while still rejecting line-like glare.
-TARGET_MAX_PERSPECTIVE_ASPECT = 5.0
-TARGET_MIN_ROTATED_FILL = 0.42
-TARGET_MAX_ROTATED_FILL = 0.94
+TARGET_MAX_PERSPECTIVE_ASPECT = 3.8
+TARGET_MIN_ROTATED_FILL = 0.56
+TARGET_MAX_ROTATED_FILL = 0.90
 
 # Reflection rejection. A genuine painted disc should contain a substantial
 # amount of red/pink colour across its silhouette. Specular reflections often
 # have a white/neutral core or only a thin coloured rim.
-TARGET_MIN_COLOUR_COVERAGE = 0.52
-TARGET_MAX_NEUTRAL_HIGHLIGHT = 0.32
+TARGET_MIN_COLOUR_COVERAGE = 0.62
+TARGET_MAX_NEUTRAL_HIGHLIGHT = 0.22
 HIGHLIGHT_MIN = 240
 HIGHLIGHT_MAX_CHROMA = 24
+
+# Strong shape validation: actual targets should look like circles/ellipses,
+# while light reflections and red spill usually have irregular boundaries.
+TARGET_MIN_CIRCULARITY = 0.58
+TARGET_MAX_ELLIPSE_ERROR = 0.24
+TARGET_MIN_SOLIDITY = 0.90
 
 MIN_FILL = 0.3          # cheap first-pass blob fill check
 
@@ -601,7 +607,9 @@ def _red_and_pink_circle_masks(img):
 def _candidate_geometry_and_reflection_metrics(img, labels, label_id, bx, by, bw, bh):
     """Cheap per-candidate validation on a small ROI.
 
-    Returns (major_px, aspect, rotated_fill, colour_coverage, neutral_highlight)
+    Returns
+    (major_px, aspect, rotated_fill, colour_coverage, neutral_highlight,
+     circularity, solidity, ellipse_error)
     or None when no usable contour exists.
     """
     label_roi = labels[by:by + bh, bx:bx + bw]
@@ -622,7 +630,7 @@ def _candidate_geometry_and_reflection_metrics(img, labels, label_id, bx, by, bw
     if rw <= 0.0 or rh <= 0.0:
         # Tiny 1-2 px candidates cannot provide a stable rotated rectangle.
         major = float(max(bw, bh))
-        return major, 1.0, 0.78, 1.0, 0.0
+        return major, 1.0, 0.78, 1.0, 0.0, 1.0, 1.0, 0.0
 
     major = float(max(rw, rh))
     minor = float(min(rw, rh))
@@ -672,7 +680,35 @@ def _candidate_geometry_and_reflection_metrics(img, labels, label_id, bx, by, bw
     )
     highlight_fraction = float(np.count_nonzero(neutral_highlight)) / inside_count
 
-    return major, aspect, rotated_fill, colour_coverage, highlight_fraction
+    # Boundary quality.
+    perimeter = cv2.arcLength(contour, True)
+    circularity = (
+        4.0 * math.pi * contour_area / (perimeter * perimeter)
+        if perimeter > 0.0 else 0.0
+    )
+
+    hull = cv2.convexHull(contour)
+    hull_area = abs(cv2.contourArea(hull))
+    solidity = contour_area / hull_area if hull_area > 0.0 else 0.0
+
+    # Compare the contour's filled silhouette against its best-fit ellipse.
+    # This is cheap because it runs only on an already small candidate ROI.
+    ellipse_error = 1.0
+    if len(contour) >= 5 and max(rw, rh) >= 8:
+        ellipse = cv2.fitEllipse(contour)
+        ellipse_mask = np.zeros((bh, bw), dtype=np.uint8)
+        cv2.ellipse(ellipse_mask, ellipse, 255, cv2.FILLED)
+        inter = cv2.countNonZero(cv2.bitwise_and(silhouette, ellipse_mask))
+        union = cv2.countNonZero(cv2.bitwise_or(silhouette, ellipse_mask))
+        if union > 0:
+            ellipse_error = 1.0 - (inter / float(union))
+    elif max(rw, rh) < 8:
+        ellipse_error = 0.0
+
+    return (
+        major, aspect, rotated_fill, colour_coverage, highlight_fraction,
+        circularity, solidity, ellipse_error
+    )
 
 
 def detect(frame, exp_px, roi=None, prefer=None):
@@ -720,7 +756,10 @@ def detect(frame, exp_px, roi=None, prefer=None):
         )
         if metrics is None:
             continue
-        major, aspect, rotated_fill, colour_coverage, highlight_fraction = metrics
+        (
+            major, aspect, rotated_fill, colour_coverage, highlight_fraction,
+            circularity, solidity, ellipse_error
+        ) = metrics
         ratio = major / exp_work
 
         if not (TARGET_SIZE_RATIO[0] <= ratio <= TARGET_SIZE_RATIO[1]):
@@ -734,13 +773,20 @@ def detect(frame, exp_px, roi=None, prefer=None):
                 continue
             if highlight_fraction > TARGET_MAX_NEUTRAL_HIGHLIGHT:
                 continue
+            if circularity < TARGET_MIN_CIRCULARITY:
+                continue
+            if solidity < TARGET_MIN_SOLIDITY:
+                continue
+            if ellipse_error > TARGET_MAX_ELLIPSE_ERROR:
+                continue
         if max(bw, bh) >= 8 and area / float(bw * bh) < MIN_FILL:
             continue
 
-        # Prefer candidates closest to the physically expected apparent size.
-        # Reflection penalties break ties without adding temporal state.
+        # Ranking now strongly prefers clean circular/elliptical targets.
         cost = abs(math.log(max(ratio, 1e-6)))
-        cost += max(0.0, TARGET_MIN_COLOUR_COVERAGE - colour_coverage) * 2.0
+        cost += (1.0 - min(circularity, 1.0)) * 1.8
+        cost += (1.0 - min(solidity, 1.0)) * 2.0
+        cost += ellipse_error * 2.2
         cost += highlight_fraction * 1.5
         if prefer_work is not None:
             cxw, cyw = bx + bw / 2, by + bh / 2
