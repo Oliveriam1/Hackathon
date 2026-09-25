@@ -1,74 +1,31 @@
-"""Čitelný stav a omezený záznam důkazů pro ladění bez živého okna."""
+"""Ladění bez okna: každé 2 s uloží surový a označený snímek + stav (nejvýše 30 sad)."""
 import json
 from pathlib import Path
 import tempfile
 import time
 import cv2
-from .vision import annotate_observation
+from .vision import annotate
 
 
 class Diagnostics:
-    def __init__(self, stream=None, directory=None, clock=time.monotonic):
-        self.stream, self.clock = stream, clock
-        self.last_report = None
-        self.last_saved = None
-        self.count = 0
+    def __init__(self, directory, *, every_s=2., limit=30, clock=time.monotonic):
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        self.directory = Path(tempfile.mkdtemp(prefix='run-', dir=directory))
+        self.every_s, self.limit, self.clock = every_s, limit, clock
         self.saved = 0
-        self.directory = None
-        if directory is not None:
-            Path(directory).mkdir(parents=True, exist_ok=True)
-            self.directory = Path(tempfile.mkdtemp(prefix='run-', dir=directory))
+        self.last_saved = None
 
-    def update(self, frame, observation, record):
+    def update(self, frame, observation, aim, record):
         now = self.clock()
-        self.count += 1
-        if self.stream is not None and (self.last_report is None or now-self.last_report >= 1):
-            fps = '--' if self.last_report is None else f'{self.count/(now-self.last_report):.1f}'
-            lock = record['visual_lock']['state']
-            kind = 'MERENI' if observation.measured else ('PREDIKCE' if observation.target else 'ZADNY')
-            point = observation.measurement
-            position = f'({point.x:.0f}, {point.y:.0f})' if point is not None else '--'
-            stage = ('BEZ_4UHELNIKU' if not observation.rectangles else
-                     'BEZ_KOLECKA_UVNITR' if not observation.circles else
-                     'VICE_KANDIDATU' if len(observation.circles) > 1 else 'KANDIDAT')
-            timings = observation.stage_ms or {}
-            detail = '/'.join(f'{timings.get(key, 0):.0f}' for key in
-                              ('prepare', 'quadrilaterals', 'circles_and_tracking'))
-            if observation.detector_mode == 'red':
-                debug = observation.red or {}
-                stage = debug.get('tracking', {}).get('state', 'SEARCHING')
-                rejected = debug.get('diagnostics', {}).get('rejections', {})
-                stage += ' odmitnuto=' + (','.join(f'{k}:{v}' for k, v in rejected.items()) or '--')
-                detail = '/'.join(f'{timings.get(k, 0):.0f}' for k in
-                                  ('mask', 'components', 'validation', 'geometry', 'tracking'))
-            gimbal = record.get('gimbal', {})
-            servo_text = ''
-            if gimbal.get('enabled'):
-                angles = gimbal['commanded_angles_deg']
-                servo_text = f" | kamera={gimbal['state']} {angles['right']:+.1f}/{angles['forward']:+.1f} deg"
-                if gimbal.get('dry_run'):
-                    servo_text += ' DRY_RUN'
-            geo_text = ''
-            geo_status = record.get('geolocation_status', 'DISABLED')
-            if geo_status != 'DISABLED':
-                geo_text = f' | poloha={geo_status}'
-                fix = record.get('geolocation')
-                if fix is not None:
-                    geo_text += f" {fix['latitude_deg']:.7f}, {fix['longitude_deg']:.7f}"
-            boundary = record.get('boundary', {})
-            boundary_text = (f" | paska={boundary['state']} useky={len(boundary['segments_px'])} zona=NEOVERENA"
-                             if boundary.get('enabled') else '')
-            print(f'FPS={fps} | detekce={observation.processing_ms:.0f} ms | '
-                  f'4uhelniky={len(observation.rectangles)} | kandidati={len(observation.circles)} | '
-                  f'{kind} {position} | {lock} | {stage} | faze_ms={detail}{servo_text}{geo_text}{boundary_text}', file=self.stream, flush=True)
-            self.last_report, self.count = now, 0
-        if self.directory is not None and self.saved < 30 and (self.last_saved is None or now-self.last_saved >= 2):
-            prefix = self.directory / f'{self.saved:03d}'
-            for suffix, image in (('raw', frame), ('marked', annotate_observation(frame, observation))):
-                success, encoded = cv2.imencode('.png', image)
-                if not success:
-                    raise RuntimeError('Nelze uložit diagnostický snímek.')
-                encoded.tofile(str(prefix) + f'-{suffix}.png')
-            Path(str(prefix) + '.json').write_text(json.dumps(record, indent=2, allow_nan=False), encoding='utf-8')
-            self.saved += 1
-            self.last_saved = now
+        if self.saved >= self.limit or (self.last_saved is not None and now-self.last_saved < self.every_s):
+            return False
+        prefix = self.directory / f'{self.saved:03d}'
+        for suffix, image in (('raw', frame), ('marked', annotate(frame, observation, aim))):
+            success, encoded = cv2.imencode('.png', image)
+            if not success:
+                raise RuntimeError('Nelze uložit diagnostický snímek.')
+            encoded.tofile(f'{prefix}-{suffix}.png')
+        Path(f'{prefix}.json').write_text(json.dumps(record, indent=2, allow_nan=False), encoding='utf-8')
+        self.saved += 1
+        self.last_saved = now
+        return True

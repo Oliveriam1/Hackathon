@@ -13,18 +13,31 @@ venv/
 .vscode/
 .idea/
 
-# Runtime data
-captures/*
-logs/*
+# Runtime data (diagnostické snímky, záznamy)
+captures/
+logs/
+kontrola/
+*.jsonl
 
 # Environment variables
 .env
-
-# Models / large files
-*.pt
-*.onnx
-tests/*
-!tests/test_takeoff.py
-!tests/test_search.py
-!tests/test_boundary.py
-!tests/test_mission.py
+tests/test_aim.py
+tests/test_app_lifecycle.py
+tests/test_app.py
+tests/test_approach.py
+tests/test_data_pipeline.py
+tests/test_detection_regressions.py
+tests/test_diagnostics.py
+tests/test_drone_data.py
+tests/test_evaluation.py
+tests/test_flight_runner.py
+tests/test_gimbal_controller.py
+tests/test_gimbal.py
+tests/test_locate.py
+tests/test_mavlink_backend.py
+tests/test_precision.py
+tests/test_red_detector.py
+tests/test_tape.py
+tests/test_target_locator.py
+tests/test_target_lock.py
+tests/test_telemetry.py

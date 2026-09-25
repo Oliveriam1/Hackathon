@@ -1,12 +1,46 @@
-"""Dvouosý závěs kamery (2x MG996R) přes pigpio, stejné hodnoty jako red_tracker.py.
+"""Dvouosý závěs kamery (2x MG996R) přes pigpio nebo lgpio.
 
 x = náklon kamery doprava (+) / doleva (-), y = dopředu (+) / dozadu (-),
-0/0 = kolmo dolů. Na Pi: sudo apt install pigpio python3-pigpio
-a sudo systemctl enable --now pigpiod.
+0/0 = kolmo dolů. Úhly jsou SKUTEČNÉ úhly kamery; převod na pulzy upravuje
+volitelná kalibrace serv (tools/calibrate_servos.py), protože MG996R nemá
+přesně 90° na 1000 µs ani přesnou nulu.
+Na Pi: sudo apt install pigpio python3-pigpio && sudo systemctl enable --now pigpiod
+(nebo python3-lgpio).
 """
+import json
+from dataclasses import dataclass
 
-from .config import (X_PIN, Y_PIN, X_CENTER_US, Y_CENTER_US, US_PER_DEG,
-                     X_DIR, Y_DIR, X_LIMITS, Y_LIMITS)
+X_PIN, Y_PIN = 18, 13            # BCM: vnější servo (doprava), vnitřní servo (dopředu)
+X_CENTER_US, Y_CENTER_US = 1500, 1500
+US_PER_DEG = 1000.0 / 90.0
+X_DIR, Y_DIR = 1, 1
+X_LIMITS = (-60.0, 60.0)
+Y_LIMITS = (-45.0, 45.0)
+
+
+@dataclass(frozen=True)
+class ServoCalibration:
+    """Skutečný úhel = scale * příkaz + offset, pro každou osu zvlášť."""
+    right_scale: float = 1.0
+    right_offset: float = 0.0
+    forward_scale: float = 1.0
+    forward_offset: float = 0.0
+
+    @classmethod
+    def load(cls, path):
+        with open(path, encoding='utf-8') as file:
+            data = json.load(file)
+        return cls(float(data['right']['scale']), float(data['right']['offset']),
+                   float(data['forward']['scale']), float(data['forward']['offset']))
+
+    def save(self, path):
+        with open(path, 'w', encoding='utf-8') as file:
+            json.dump({'right': {'scale': self.right_scale, 'offset': self.right_offset},
+                       'forward': {'scale': self.forward_scale, 'offset': self.forward_offset}}, file, indent=2)
+
+    def command(self, right, forward):
+        """Skutečný úhel -> příkaz serva ve stupních."""
+        return (right-self.right_offset)/self.right_scale, (forward-self.forward_offset)/self.forward_scale
 
 
 class _Lgpio:
@@ -58,10 +92,11 @@ def _connect():
 
 
 class Gimbal:
-    """Úhly x, y jsou fyzické (stupně). Při otevření najede do 0/0."""
+    """Úhly x, y jsou skutečné úhly kamery (stupně). Při otevření najede do 0/0 (kolmo dolů)."""
 
-    def __init__(self, pi=None, *, x_dir=X_DIR, y_dir=Y_DIR):
+    def __init__(self, pi=None, *, x_dir=X_DIR, y_dir=Y_DIR, calibration=None):
         self.x_dir, self.y_dir = x_dir, y_dir
+        self.calibration = calibration or ServoCalibration()
         self.x = self.y = 0.0
         self.pi = pi
 
@@ -71,8 +106,9 @@ class Gimbal:
         self.move_to(0.0, 0.0)
 
     def pulses(self):
-        px = X_CENTER_US + self.x_dir * self.x * US_PER_DEG
-        py = Y_CENTER_US + self.y_dir * self.y * US_PER_DEG
+        cx, cy = self.calibration.command(self.x, self.y)
+        px = X_CENTER_US + self.x_dir * cx * US_PER_DEG
+        py = Y_CENTER_US + self.y_dir * cy * US_PER_DEG
         return int(max(500, min(2500, px))), int(max(500, min(2500, py)))
 
     def move_to(self, x, y):

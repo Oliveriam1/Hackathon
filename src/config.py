@@ -1,218 +1,155 @@
-"""Konfigurace aplikace a validace CLI; import neotevírá hardware."""
+"""Parametry příkazové řádky a jejich kontrola. Import neotevírá kameru ani serva."""
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-import numpy as np
-
-# Dosavadní nastavení hardwaru; změna struktury nemění pulzy ani zapojení.
-X_PIN, Y_PIN = 18, 13
-X_CENTER_US, Y_CENTER_US = 1500, 1500
-US_PER_DEG = 1000.0 / 90.0
-X_DIR, Y_DIR = 1, 1
-X_LIMITS = (-60.0, 60.0)
-Y_LIMITS = (-45.0, 45.0)
-
-
-@dataclass(frozen=True)
-class StartReference:
-    """Budoucí počátek lokální mapy; WGS84, nikoli detekce zelené barvy."""
-    latitude_deg: float
-    longitude_deg: float
-
-    def __post_init__(self):
-        if not (-90 <= self.latitude_deg <= 90 and -180 <= self.longitude_deg <= 180):
-            raise ValueError('Neplatné souřadnice startovní reference.')
-
-
-@dataclass(frozen=True)
-class MissionConfig:
-    """Rezervovaná konfigurace mise; zatím se nenačítá z CLI ani neřídí let.
-
-    Neznámé hodnoty zůstávají None. AppConfig.altitude není výška vzletu.
-    """
-    start: StartReference | None = None
-    takeoff_height_m: float | None = None
+import math
 
 
 @dataclass(frozen=True)
 class AppConfig:
-    """Ověřené CLI hodnoty. altitude je odhad pro detekci, nikoli povel ke vzletu."""
+    # Zdroj obrazu
     camera: int = 0
-    image: Path | None = None
-    video: Path | None = None
-    demo: bool = False
     picamera: int | None = None
-    snapshot: Path | None = None
-    headless: bool = False
-    status: bool = False
-    drone_data: bool = False
-    detect_boundary: bool = False
-    diagnostics: Path | None = None
-    record_dir: Path | None = None
-    sensitivity: float = 1.5
-    hough: bool = False
-    detector: str = 'red'
-    saturation: float | None = None
-    redness_min: int = 25
-    red_fraction: float = 0.35
-    r_min: int = 50
-    tune: bool = False
-    altitude: float | None = None
-    target_diameter_m: float = 0.20
-    hfov_deg: float = 54.0
-    camera_calibration: Path | None = None
-    geometry_debug: bool = False
-    red_diameter_px: float | None = None
+    video: Path | None = None
+    image: Path | None = None
+    demo: bool = False
+    width: int = 1296
+    height: int = 972
     tuning_file: str | None = None
-    output: Path | None = None
-    frames: int | None = None
-    width: int = 640
-    height: int = 480
-    mavlink: str | None = None
-    baud: int = 115200
-    target_system: int | None = None
     ev: float | None = None
-    locate_target: bool = False
-    ground_relative_alt: float | None = None
-    camera_right_deg: float | None = None
-    camera_forward_deg: float | None = None
-    track_camera: bool = False
-    gimbal_dry_run: bool = False
+    saturation: float | None = None
+    # Detekce
+    redness_min: int = 25
+    r_min: int = 50
+    red_fraction: float = 0.35
+    red_diameter_px: float | None = None
+    target_diameter_m: float = 0.20
+    tune: bool = False
+    # Kamera a serva
+    camera_calibration: Path | None = None
+    hfov_deg: float = 54.0
+    image_top: str = 'forward'
+    gimbal: str = 'servo'                  # servo | dry-run | fixed
+    fixed_angles: tuple[float, float] = (0., 0.)
     servo_x_dir: int = 1
     servo_y_dir: int = 1
+    servo_calibration: Path | None = None
     gimbal_speed: float = 15.0
-    image_top: str = 'forward'
-    servo: bool = False
-    jako_red_tracker: bool = False
+    scan: bool = True
+    # Výsledek
+    samples: int = 20
+    drone_pose: tuple | None = None
+    pose_file: Path | None = None
+    result: Path | None = None
+    once: bool = False
+    output: Path | None = None
+    # Běh
+    headless: bool = False
+    frames: int | None = None
+    diagnostics: Path | None = None
+    snapshot: Path | None = None
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description='Míření kamery na střed červené tečky a (volitelně) výpočet jejích souřadnic.')
+    source = parser.add_argument_group('zdroj obrazu').add_mutually_exclusive_group()
+    source.add_argument('--picamera', type=int, metavar='INDEX', help='CSI kamera přes Picamera2 (na dronu: 0).')
+    source.add_argument('--camera', type=int, default=0, help='USB/webkamera, index (výchozí 0).')
+    source.add_argument('--video', type=Path, help='Videozáznam místo kamery (serva se nehýbou).')
+    source.add_argument('--image', type=Path, help='Jedna fotografie (serva se nehýbou).')
+    source.add_argument('--demo', action='store_true', help='Syntetický snímek bez kamery.')
+    group = parser.add_argument_group('kamera')
+    group.add_argument('--width', type=int, default=1296, help='Šířka snímku (výchozí 1296 = celé zorné pole OV5647).')
+    group.add_argument('--height', type=int, default=972)
+    group.add_argument('--tuning-file', help='Profil libcamera (výchozí ov5647_noir.json; none = systémový).')
+    group.add_argument('--ev', type=float, help='Kompenzace expozice CSI kamery, -8 až 8.')
+    group.add_argument('--saturation', type=float, help='Sytost barev CSI kamery 0-32 (1 = beze změny).')
+    group.add_argument('--camera-calibration', type=Path, help='JSON z calibrate_camera.py pro dané rozlišení.')
+    group.add_argument('--hfov-deg', type=float, default=54.0, help='Vodorovné zorné pole bez kalibrace.')
+    group.add_argument('--image-top', choices=('forward', 'right', 'backward', 'left'), default='forward',
+                       help='Kam na dronu ukazuje horní okraj obrazu při kameře kolmo dolů.')
+    group = parser.add_argument_group('detekce tečky')
+    group.add_argument('--redness-min', type=int, default=25, help='Práh R - max(G, B).')
+    group.add_argument('--r-min', type=int, default=50, help='Minimální R.')
+    group.add_argument('--red-fraction', type=float, default=0.35, help='Práh (R - max(G, B)) / R.')
+    group.add_argument('--red-diameter-px', type=float, help='Očekávaný průměr tečky v px (tvrdý filtr velikosti).')
+    group.add_argument('--target-diameter-m', type=float, default=0.20, help='Skutečný průměr tečky (pro odhad velikosti).')
+    group.add_argument('--tune', action='store_true', help='Posuvníky prahů v okně náhledu.')
+    group = parser.add_argument_group('serva')
+    mode = group.add_mutually_exclusive_group()
+    mode.add_argument('--dry-run', action='store_true', help='Úhly počítat, ale serva nehýbat.')
+    mode.add_argument('--fixed-camera', nargs=2, type=float, metavar=('RIGHT', 'FORWARD'),
+                      help='Bez serv: kamera pevně v daných úhlech (např. 0 0 = kolmo dolů).')
+    group.add_argument('--servo-x-dir', type=int, choices=(-1, 1), default=1, help='Otočí směr vnějšího serva.')
+    group.add_argument('--servo-y-dir', type=int, choices=(-1, 1), default=1, help='Otočí směr vnitřního serva.')
+    group.add_argument('--servo-calibration', type=Path, help='JSON z tools/calibrate_servos.py.')
+    group.add_argument('--gimbal-speed', type=float, default=15.0, help='Max. rychlost serv ve °/s (0-60].')
+    group.add_argument('--no-scan', action='store_true', help='Neprohledávat okolí, když tečka není vidět.')
+    group = parser.add_argument_group('výsledek')
+    group.add_argument('--samples', type=int, default=20, help='Počet vycentrovaných snímků pro medián úhlu.')
+    pose = group.add_mutually_exclusive_group()
+    pose.add_argument('--drone-pose', nargs=4, type=float, metavar=('LAT', 'LON', 'VYSKA_M', 'KURZ_DEG'),
+                      help='Poloha dronu -> vypočítat i souřadnice tečky.')
+    pose.add_argument('--pose-file', type=Path, help='JSON s polohou dronu, čte se při každém výsledku.')
+    group.add_argument('--result', type=Path, help='Uložit poslední výsledek jako JSON.')
+    group.add_argument('--once', action='store_true', help='Skončit po prvním výsledku.')
+    group.add_argument('--output', type=Path, help='Zapisovat stav každého snímku jako JSON řádky.')
+    group = parser.add_argument_group('běh')
+    group.add_argument('--headless', action='store_true', help='Bez okna náhledu (přes SSH).')
+    group.add_argument('--frames', type=int, help='Skončit po daném počtu snímků.')
+    group.add_argument('--diagnostics', type=Path, help='Každé 2 s uložit snímek + stav (max. 30) pro ladění.')
+    group.add_argument('--snapshot', type=Path, help='Jen uložit jednu fotku z kamery a skončit.')
+    return parser
 
 
 def parse_args(argv=None) -> AppConfig:
-    parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--camera", type=int, default=0, help="Index kamery (výchozí: 0).")
-    source.add_argument("--image", type=Path, help="Obrázek místo živé kamery.")
-    source.add_argument("--video", type=Path, help="Videozáznam místo živé kamery, např. z letu.")
-    source.add_argument("--demo", action="store_true", help="Testovací obraz bez kamery.")
-    source.add_argument("--picamera", type=int, metavar="INDEX", help="CSI kamera přes Picamera2, např. --picamera 0.")
-    parser.add_argument("--snapshot", type=Path, help="Uloží jeden snímek bez grafického okna (např. test.jpg).")
-    parser.add_argument('--headless', action='store_true', help='Jen data, bez grafického okna; ukončení Ctrl+C.')
-    parser.add_argument('--status', action='store_true', help='Čitelný stav 1x za sekundu místo JSON v terminálu.')
-    parser.add_argument('--drone-data', action='store_true', help='Pouze JSON kontrakt vizuálních dat pro řídicí část, bez odesílání povelů.')
-    parser.add_argument('--detect-boundary', action='store_true', help='Kandidáty červenobílé pásky v obraze a JSON; neověřuje uzavřenou zónu.')
-    parser.add_argument('--diagnostics', type=Path, help='Uloží nejvýše 30 dvojic raw/marked snímků, každé 2 s.')
-    parser.add_argument('--record-dir', type=Path, help='Uloží každý zpracovaný snímek a čas pro offline vyhodnocení; délku omezte --frames.')
-    parser.add_argument('--sensitivity', type=float, choices=(1, 1.5, 2, 3), default=1.5)
-    parser.add_argument('--hough', action='store_true', help='Pomalá záloha pro přerušené kruhové hrany (pro porovnání).')
-    parser.add_argument('--detector', choices=('geometry', 'red'), default='red',
-                        help='red (výchozí) = červené/růžové tečky s kontrolou tvaru a trackingem; geometry = kolečko v obdélníku.')
-    parser.add_argument('--saturation', type=float,
-                        help='Sytost barev CSI kamery 0-32 (libcamera Saturation, 1 = beze změny). '
-                             'Výchozí nastavení kamery jako red_tracker.py; např. 2 zvýrazní červenou.')
-    parser.add_argument('--redness-min', type=int, default=25, help='Práh R - max(G, B), výchozí 25 jako red_tracker.py.')
-    parser.add_argument('--red-fraction', type=float, default=0.35,
-                        help='Práh (R - max(G, B)) / R, výchozí 0.35; nižší přijme i matnou červenou.')
-    parser.add_argument('--r-min', type=int, default=50, help='Minimální R, výchozí 50.')
-    parser.add_argument('--tune', action='store_true', help='Posuvníky prahů červené a sytosti v okně (jako red_tracker --tune).')
-    parser.add_argument('--altitude', type=float, help='Ruční odhad výšky v metrech; pouze měkké skóre velikosti.')
-    parser.add_argument('--target-diameter-m', type=float, default=0.20, help='Skutečný průměr terče v metrech.')
-    parser.add_argument('--hfov-deg', type=float, default=54.0, help='Jmenovitý horizontální zorný úhel.')
-    parser.add_argument('--camera-calibration', type=Path, help='JSON kalibrace CameraModel pro aktuální rozlišení.')
-    parser.add_argument('--geometry-debug', action='store_true', help='Volitelný geometrický náhled okolí kandidáta.')
-    parser.add_argument('--red-diameter-px', type=float, help='Očekávaný průměr červené tečky v pixelech; jinak bez filtru velikosti.')
-    parser.add_argument('--tuning-file', help='CSI profil (výchozí ov5647_noir.json: kamera bez IR filtru, jinak růžový obraz). '
-                                              'Hodnota none ponechá systémový profil.')
-    parser.add_argument('--output', type=Path, help='Připojuje JSON Lines do souboru; jinak zapisuje na stdout.')
-    parser.add_argument('--frames', type=int, help='Ukončit po daném počtu nových snímků.')
-    parser.add_argument('--width', type=int, default=640, help='Šířka CSI snímku.')
-    parser.add_argument('--height', type=int, default=480, help='Výška CSI snímku.')
-    parser.add_argument('--mavlink', help='Port/endpoint ArduPilotu; jen telemetrie, např. /dev/ttyACM0.')
-    parser.add_argument('--baud', type=int, default=115200, help='Rychlost sériového MAVLink spojení.')
-    parser.add_argument('--target-system', type=int, help='Očekávané MAVLink system ID autopilota.')
-    parser.add_argument('--ev', type=float, default=None,
-                        help='Kompenzace expozice CSI kamery, např. --ev -2. Jinak výchozí nastavení profilu.')
-    parser.add_argument('--locate-target', action='store_true', help='Odhad souřadnic cíle z čerstvé telemetrie.')
-    parser.add_argument('--ground-relative-alt', type=float, help='Výška roviny terče vůči home autopilota v metrech; 0 pouze pro stejnou výšku.')
-    parser.add_argument('--camera-right-deg', type=float, help='Známý pevný náklon kamery doprava, stupně.')
-    parser.add_argument('--camera-forward-deg', type=float, help='Známý pevný náklon kamery dopředu, stupně.')
-    parser.add_argument('--track-camera', action='store_true', help='Automaticky centrovat kameru servy na potvrzený cíl.')
-    parser.add_argument('--gimbal-dry-run', action='store_true', help='S --track-camera počítat úhly bez GPIO.')
-    parser.add_argument('--servo-x-dir', type=int, choices=(-1, 1), default=1)
-    parser.add_argument('--servo-y-dir', type=int, choices=(-1, 1), default=1)
-    parser.add_argument('--gimbal-speed', type=float, default=15., help='Maximální rychlost každé osy ve stupních/s.')
-    parser.add_argument('--image-top', choices=('forward', 'right', 'backward', 'left'), default='forward')
-    parser.add_argument('--servo', action='store_true',
-                        help='Serva závěsu přes pigpio (BCM 18 a 13) jako red_tracker.py; najedou do 0/0.')
-    parser.add_argument('--jako-red-tracker', action='store_true',
-                        help='Vše jako red_tracker.py: CSI 1296x972, profil ov5647_noir.json, serva --servo.')
-    args = parser.parse_args(argv)
-    if args.drone_data and (args.status or args.snapshot):
-        parser.error('--drone-data nelze kombinovat s --status ani --snapshot.')
-    if args.jako_red_tracker:
-        if args.image or args.video or args.demo:
-            parser.error('--jako-red-tracker vyžaduje CSI kameru.')
-        args.picamera = 0 if args.picamera is None else args.picamera
-        args.width, args.height = 1296, 972  # plné zorné pole OV5647, binning 2x2
-        args.tuning_file = args.tuning_file or 'ov5647_noir.json'
-        args.servo = True
-    if args.gimbal_dry_run and (not args.track_camera or args.servo):
-        parser.error('--gimbal-dry-run vyžaduje --track-camera a nesmí zapnout --servo ani preset serv.')
-    if args.track_camera:
-        if args.image or args.video or args.demo or args.snapshot:
-            parser.error('--track-camera vyžaduje živou kameru, i pro dry-run.')
-        args.servo = not args.gimbal_dry_run
-    fixed = (args.camera_right_deg, args.camera_forward_deg)
-    if any(v is not None for v in fixed) and not all(v is not None and np.isfinite(v) and abs(v) <= 90 for v in fixed):
-        parser.error('Zadejte oba pevné úhly kamery v rozsahu -90 až 90 stupňů.')
-    if args.ground_relative_alt is not None and not np.isfinite(args.ground_relative_alt):
-        parser.error('--ground-relative-alt musí být konečné číslo.')
-    if args.locate_target:
-        if not args.mavlink or args.ground_relative_alt is None:
-            parser.error('--locate-target vyžaduje --mavlink a explicitní --ground-relative-alt.')
-        if args.gimbal_dry_run:
-            parser.error('Simulované úhly z dry-run nelze použít k lokalizaci.')
-        if args.servo and fixed[0] is not None:
-            parser.error('Zvolte úhly skutečného závěsu, nebo pevné úhly, nikoli obojí.')
-        if not args.servo and fixed[0] is None:
-            parser.error('Lokalizace vyžaduje známé pevné úhly kamery, nebo skutečný závěs --servo.')
-    if not np.isfinite(args.gimbal_speed) or not 0 < args.gimbal_speed <= 60:
-        parser.error('--gimbal-speed musí být v rozsahu (0, 60] stupňů/s.')
-    if args.red_diameter_px is not None and (not np.isfinite(args.red_diameter_px) or args.red_diameter_px <= 0 or args.detector != 'red'):
-        parser.error('--red-diameter-px musí být kladné číslo a vyžaduje --detector red.')
-    if args.tuning_file is not None and args.picamera is None:
-        parser.error('--tuning-file vyžaduje --picamera.')
-    if args.hough and args.detector == 'red':
-        parser.error('--hough je pouze pro --detector geometry.')
-    if args.saturation is not None and (not np.isfinite(args.saturation) or not 0 <= args.saturation <= 32):
-        parser.error('--saturation musí být v rozsahu 0 až 32.')
-    if not (0 <= args.redness_min <= 255 and 0 <= args.r_min <= 255 and 0 <= args.red_fraction <= 1):
-        parser.error('Prahy červené: --redness-min a --r-min 0-255, --red-fraction 0-1.')
-    if args.tune and (args.headless or args.detector != 'red'):
-        parser.error('--tune vyžaduje okno (bez --headless) a --detector red.')
-    if args.altitude is not None and (not np.isfinite(args.altitude) or args.altitude <= 0):
-        parser.error('--altitude musí být kladná výška v metrech.')
-    if not np.isfinite(args.target_diameter_m) or args.target_diameter_m <= 0:
-        parser.error('--target-diameter-m musí být kladné číslo.')
-    if not np.isfinite(args.hfov_deg) or not 1 < args.hfov_deg < 179:
-        parser.error('--hfov-deg musí být mezi 1 a 179 stupni.')
-    if args.frames is not None and args.frames < 1:
-        parser.error('--frames musí být kladné.')
-    if args.baud <= 0 or (args.target_system is not None and not 1 <= args.target_system <= 255):
-        parser.error('Neplatné --baud nebo --target-system.')
-    if args.mavlink and (args.demo or args.image or args.video or args.snapshot):
-        parser.error('--mavlink připojujte pouze k živé detekci, nikoliv k záznamu nebo fotografii.')
-    if args.width < 1 or args.height < 1:
+    parser = build_parser()
+    a = parser.parse_args(argv)
+    live = not (a.video or a.image or a.demo)
+    if a.fixed_camera is not None:
+        if not all(math.isfinite(v) and abs(v) <= 90 for v in a.fixed_camera):
+            parser.error('--fixed-camera: úhly v rozsahu -90 až 90°.')
+        gimbal, fixed = 'fixed', tuple(a.fixed_camera)
+    elif not live:
+        gimbal, fixed = 'fixed', (0., 0.)     # záznam/fotka nereaguje na serva: kamera jako pevná
+    elif a.dry_run:
+        gimbal, fixed = 'dry-run', (0., 0.)
+    else:
+        gimbal, fixed = 'servo', (0., 0.)
+    if a.width < 1 or a.height < 1:
         parser.error('Rozlišení musí být kladné.')
-    if args.output and any(path and path.resolve() == args.output.resolve() for path in (args.image, args.video)):
-        parser.error('Výstupní data nesmí přepisovat vstupní obraz/video.')
-    if args.snapshot and (args.output or args.headless or args.frames or args.status or args.diagnostics or args.record_dir):
-        parser.error('--snapshot je samostatný režim fotografie; pro data použijte --headless.')
-    if args.camera < 0:
-        parser.error("Index kamery musí být nezáporný.")
-    if args.picamera is not None and args.picamera < 0:
-        parser.error("Index CSI kamery musí být nezáporný.")
-    if args.ev is not None and args.picamera is None:
-        parser.error('--ev lze použít pouze s --picamera.')
-    if args.ev is not None and (not np.isfinite(args.ev) or not -8 <= args.ev <= 8):
+    if not 0 < a.gimbal_speed <= 60 or not math.isfinite(a.gimbal_speed):
+        parser.error('--gimbal-speed musí být v rozsahu (0, 60].')
+    if a.samples < 3:
+        parser.error('--samples musí být alespoň 3.')
+    if not 1 < a.hfov_deg < 179:
+        parser.error('--hfov-deg musí být mezi 1 a 179°.')
+    if not (0 <= a.redness_min <= 255 and 0 <= a.r_min <= 255 and 0 <= a.red_fraction <= 1):
+        parser.error('Prahy červené: --redness-min a --r-min 0-255, --red-fraction 0-1.')
+    if a.red_diameter_px is not None and not (math.isfinite(a.red_diameter_px) and a.red_diameter_px > 0):
+        parser.error('--red-diameter-px musí být kladné.')
+    if not (math.isfinite(a.target_diameter_m) and a.target_diameter_m > 0):
+        parser.error('--target-diameter-m musí být kladné.')
+    if (a.tuning_file or a.ev is not None or a.saturation is not None) and a.picamera is None:
+        parser.error('--tuning-file, --ev a --saturation jsou jen pro --picamera.')
+    if a.ev is not None and not -8 <= a.ev <= 8:
         parser.error('--ev musí být v rozsahu -8 až 8.')
-    return AppConfig(**vars(args))
-
+    if a.saturation is not None and not 0 <= a.saturation <= 32:
+        parser.error('--saturation musí být v rozsahu 0 až 32.')
+    if a.tune and a.headless:
+        parser.error('--tune potřebuje okno (bez --headless).')
+    if a.frames is not None and a.frames < 1:
+        parser.error('--frames musí být kladné.')
+    if a.snapshot and (a.video or a.image or a.demo):
+        parser.error('--snapshot je jen pro živou kameru.')
+    if a.drone_pose is not None:
+        from .locate import DronePosition
+        try:
+            DronePosition(*a.drone_pose)
+        except ValueError as error:
+            parser.error(str(error))
+    values = {k: v for k, v in vars(a).items() if k not in ('dry_run', 'fixed_camera', 'no_scan')}
+    values.update(gimbal=gimbal, fixed_angles=fixed, scan=not a.no_scan,
+                  drone_pose=tuple(a.drone_pose) if a.drone_pose else None)
+    return AppConfig(**values)

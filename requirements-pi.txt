@@ -1,5 +1,2 @@
+# Na Raspberry Pi: OpenCV, Picamera2 a GPIO z balíčků systému (apt), viz README.
 numpy
-scipy
-pillow
-pyserial
-pymavlink

@@ -2,7 +2,7 @@
 import cv2
 import numpy as np
 
-from .geolocation import CameraModel
+from .geometry import CameraModel
 
 MIN_VIEWS = 10
 

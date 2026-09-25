@@ -1,199 +1,140 @@
-# Hackathon
+# Míření na červenou tečku
 
-## Skutečný let (nové)
+Program na Raspberry Pi najde kamerou červenou tečku a servy natočí kameru
+přesně na její střed. Výsledkem je **úhel kamery na střed tečky**. Když zná
+polohu dronu, podprogram z úhlu spočítá **GPS souřadnice tečky**.
 
-`tools/fly_mission.py` spojuje kameru, pásku jako zakázanou zónu, řadič mise a
-ArduPilot. Zapojení, parametry autopilota a postup testování: [FLIGHT.md](FLIGHT.md).
+Navigaci dronu (let na pozici, GPS, výška) řeší jiná část týmu. Tento program
+nekomunikuje s letovým kontrolérem.
 
-```bash
-python3 tools/fly_mission.py --connect /dev/serial0 --baud 921600 --real-flight --field-bounds -10 10 -10 10
-python3 tools/run_mission.py --tape 5 -12 5 12   # simulace s páskou
+```
+kamera ──► detekce tečky ──► serva míří na střed ──► ÚHEL (right, forward)
+                                                            │
+                        poloha dronu (GPS, výška, kurz) ────┴──► SOUŘADNICE tečky
 ```
 
-## Ověření bez zasekaného živého okna
+## Spuštění
 
 ```bash
-/usr/bin/python3 main.py --picamera 0 --headless --status --diagnostics kontrola
+# jen úhel na tečku (na dronu, přes SSH)
+python3 main.py --picamera 0 --headless
+
+# úhel + souřadnice, dron stojí na 50.0875123, 14.4213456, 5 m nad zemí, příď na sever
+python3 main.py --picamera 0 --headless --drone-pose 50.0875123 14.4213456 5.0 0 --result tecka.json --once
+
+# polohu dronu dodá jiný program do souboru (čte se při každém výsledku)
+python3 main.py --picamera 0 --headless --pose-file pose.json --result tecka.json
 ```
 
-Stav v terminálu 1x/s: FPS celého cyklu, čas detekce, počet čtyřúhelníků/kandidátů,
-aktuální měření nebo predikce a stav locku. Nejde o naměřené FPS samotného senzoru.
-`--output detections.jsonl` současně uloží strojová data. `--sensitivity 1` nastaví
-přísnější prahy i bez grafického okna; výchozí je 1.5.
+`pose.json`:
+```json
+{"latitude_deg": 50.0875123, "longitude_deg": 14.4213456, "height_m": 5.0, "heading_deg": 0.0}
+```
+(volitelně `roll_deg`, `pitch_deg`, když dron není vodorovně).
 
-Ve složce kontrola/run-* vzniknou každé dvě sekundy raw PNG, marked PNG a JSON
-stejného snímku, nejvýše 30 sad. Ukládání může krátce zpomalit cyklus; pro čisté
-měření výkonu spusťte bez --diagnostics. Každý běh používá vlastní podadresář.
+Výstup v terminálu:
+```
+CENTERED   kamera R= +12.40 F= -3.10 | detekce   38 ms, 12.1 fps | odchylka  +1.2, -0.8 px | úhel na tečku R= +12.43 F= -3.08
+ÚHEL NA STŘED TEČKY: right +12.43°, forward -3.08° (medián 20 snímků, rozptyl 0.05°)
+SOUŘADNICE TEČKY: 50.08750991, 14.42135405 (1.10 m od dronu, azimut 103°, odhad chyby ±18 cm)
+```
 
-Test: 20 s scéna bez terče (nesmí hlásit lock), pak známý terč, pohyb a zakrytí.
-Zelený overlay označuje potvrzení detektorem, nikoli důkaz správné klasifikace.
-Při zakrytí smí tracker krátce ukazovat PREDIKCE, ale vizuální lock musí být LOST
-a nesmí poskytovat platné měření pro řízení. Je-li detekce nad 250 ms,
-lock hlásí STALE_OR_REPEATED. Pro rozbor falešného nálezu použijte odpovídající
-raw/marked snímky. Syntetické testy nezaručují správnost na skutečné scéně.
+## Úhly
 
-## Vizuální lock
+| úhel | význam |
+| --- | --- |
+| `right` | náklon kamery doprava (+) / doleva (−) vůči dronu, stupně |
+| `forward` | náklon kamery dopředu (+) / dozadu (−) vůči dronu, stupně |
+| 0 / 0 | kamera míří kolmo dolů |
 
-Každý JSON nyní obsahuje `visual_lock`: stav SEARCHING / LOCKED / IMAGE_CENTERED /
-LOST / STALE_OR_REPEATED, normalizovanou chybu obrazu a stáří měření.
-X je kladně doprava, Y dolů. Jde o souřadnice **obrazu**, ne povely pro osy dronu.
-Lock používá pouze potvrzené aktuální měření, nikdy trackerovou predikci.
-Vzorek starší než 250 ms od přijetí nebo opakovaný čas se odmítá.
-IMAGE_CENTERED vyžaduje alespoň 0,5 s navazujících měření kolem středu s hysterezí
-3 % / 5 % poloviny rozměru obrazu. Ztráta nebo dlouhá mezera tento čas vynuluje.
+Úhel na tečku = skutečné natočení kamery + zbývající odchylka tečky od středu
+obrazu přepočtená přes model objektivu. Je tedy přesný i tehdy, když serva stojí
+o kousek vedle. Výsledek je medián z `--samples` (20) snímků, kdy byla tečka
+stabilně ve středu obrazu.
 
-Kamera je na pohyblivých servech: IMAGE_CENTERED tedy znamená pouze to, že kamera
-míří na terč. Není to potvrzení polohy dronu nad ním. Změna úhlů serv mění
-převod obrazu do souřadnic těla dronu, proto zatím `flight_command=null`.
-Fyzické natáčení čeká na známé zapojení serv (GPIO/PCA9685, piny/kanály), kalibraci
-jejich rozsahů a orientaci obrazu. Řízení letu navíc potřebuje připojení autopilota
-a omezení povolené oblasti. Pole lock není watchdog: příjemce musí sám odmítat
-staré zprávy, pokud kamera nebo celý program přestane vysílat.
+Stavy: `SEARCHING` (tečka není vidět), `SCANNING` (serva prohledávají okolí),
+`TRACKING` (dotahuje tečku do středu), `CENTERED` (tečka ve středu ≥ 0,5 s,
+úhel platný), `LOST`, `AMBIGUOUS` (víc podobných teček – neměří se).
 
-## Živá telemetrie ArduPilotu
+## Použití z vlastního programu
 
-Volitelně přidejte `--mavlink PORT --baud RYCHLOST`. Například **jen pokud
-váš kontrolér skutečně používá tento port**:
+```python
+from src.locate import DronePosition, locate_target
 
+drone = DronePosition(50.0875123, 14.4213456, height_m=5.0, heading_deg=0.0)
+target = locate_target(drone, right_deg=12.43, forward_deg=-3.08)
+print(target.latitude_deg, target.longitude_deg, target.error_m)
+```
+
+Míření po snímcích: `src.aim.Aimer` (jeden krok na snímek) a `src.aim.AngleAverager`
+(medián úhlu), viz `src/app.py`.
+
+## Přesnost
+
+Trojúhelník je nejpřesnější, když kamera míří **skoro kolmo dolů**. Z výšky 5 m:
+
+| zdroj chyby | kolmo dolů | 45° šikmo |
+| --- | --- | --- |
+| úhel kamery 1° | 9 cm | 17 cm |
+| náklon dronu 1° | 9 cm | 17 cm |
+| výška o 10 cm | 0 cm | 10 cm |
+| kurz dronu 2° | 0 cm | 17 cm |
+
+Proto: **kalibrovat serva** i kameru a nechat dron zastavit co nejblíž nad
+tečkou. Přesnost polohy dronu (GPS) se k tomu přičítá celá – tu dodává navigace.
+
+## Nastavení (jednou)
+
+**Raspberry Pi:**
 ```bash
-/usr/bin/python3 main.py --picamera 0 --headless --mavlink /dev/ttyACM0 --baud 115200
+sudo apt install python3-opencv python3-picamera2 pigpio python3-pigpio
+sudo systemctl enable --now pigpiod
+python3 -m venv --system-site-packages .venv && source .venv/bin/activate
 ```
 
-`pymavlink` musí být dostupný ve stejném Python prostředí. `--target-system 1`
-omezí spojení na dané MAVLink system ID. Po spojení si adaptér vyžádá
-GLOBAL_POSITION_INT (10 Hz), ATTITUDE (30 Hz), GPS_RAW_INT (2 Hz).
-Průběžně vysílá heartbeat palubního počítače. Požadované frekvence nejsou
-zaručené; chybějící/zastaralé zprávy jsou viditelné v JSON.
-Postup odpovídá [rozhraní ArduPilot MAVLink](https://en.ardupilot.org/dev/docs/mavlink-commands.html).
+**Serva** (2× MG996R, BCM 18 = vnější/doprava, BCM 13 = vnitřní/dopředu):
+1. `python3 main.py --picamera 0` (s oknem) – posuňte tečku doprava v obraze;
+   kamera se musí natočit za ní. Když jde opačně: `--servo-x-dir -1` / `--servo-y-dir -1`.
+2. Když tečka posunutá k přídi dronu není v obraze nahoře: `--image-top right|backward|left`.
+3. Kalibrace úhlů (mobil se sklonoměrem na kameře):
+   `python3 tools/calibrate_servos.py --output servo_calibration.json`,
+   pak `--servo-calibration servo_calibration.json`.
 
-JSON `telemetry` obsahuje data, stáří jednotlivých zpráv a stav fresh/missing/stale/error.
-`relative_alt_m` je výška vůči home, nikoliv měřená vzdálenost od země.
-Časy jsou časy přijetí a nejsou synchronizované s expozicí kamery.
-Aktuálně se nepřepíná letový režim, nearmuje a nevysílají letové povely.
-`flight_ready=false` a `autonomy.enabled=false` výslovně znamenají, že připojení
-telemetrie samo o sobě nezprovozňuje autonomní let.
-
-Pro autonomní misi zbývá: ověřený letový adaptér, určení povolené oblasti,
-kalibrace a časované úhly serv, synchronizace expozice/telemetrie, vyhledávací
-trajektorie a reakce na ztrátu cíle/spojení. Přítomnost GPS fixu není náhradou
-za EKF/pre-arm kontroly. Program zatím pásku jako hranici nepoznává.
-
-## Data z detekce (větev main)
-
-Bez okna, výsledky jako JSON Lines do terminálu (Ctrl+C ukončí sběr):
-
+**Kamera** (šachovnice 9×6, pole 25 mm, stejné rozlišení jako main.py):
 ```bash
-/usr/bin/python3 main.py --picamera 0 --headless --width 1280 --height 720
+python3 calibrate_camera.py --picamera 0 --output camera_calibration.json
+python3 main.py --picamera 0 --headless --camera-calibration camera_calibration.json
 ```
 
-Ukládání do souboru (záznamy se připojují, soubor se nemaže):
+**Detekce na skutečném světle:** `python3 main.py --picamera 0 --tune` (posuvníky prahů;
+program vypíše parametry k použití), bez okna `--diagnostics logs/` uloží snímky.
 
-```bash
-/usr/bin/python3 main.py --picamera 0 --headless --width 1280 --height 720 --output detections.jsonl
-```
+## Ověření přesnosti na zemi
 
-Vynecháním `--headless` zapnete diagnostický náhled, data se zapisují i s náhledem.
-`--frames 100` omezí počet zpracovaných snímků. `--ev -2` je volitelné ztmavení CSI kamery.
-`--demo --headless` nebo `--image fotka.jpg --headless` vrátí jeden záznam:
-opakování stejné fotografie nesmí vytvořit falešné potvrzení přes několik snímků.
+1. Dron na stojan, kamera 2–5 m nad zemí, změřte výšku kamery.
+2. Tečku položte do změřené vzdálenosti (např. 1,5 m před a 1 m vpravo od bodu pod kamerou).
+3. `python3 main.py --picamera 0 --headless --drone-pose <lat> <lon> <výška> <kurz> --once`
+   – porovnejte `north_m`/`east_m` ve výsledku (`--result`) se změřenými hodnotami.
 
-Každý záznam má číslo snímku, čas přijetí, rozlišení, počet kandidátů,
-stav potvrzení, `measurement_px` (aktuální nezhlazené měření) a
-`tracked_position_px` (vyhlazenou polohu či predikci). `position_kind` tyto
-stavy rozlišuje. Pro další výpočet používejte `measurement_px` pouze pokud
-`valid_pixel_position=true`. Při výpadku jsou měření i odchylka `null`, i když
-tracker ještě krátce drží potvrzený odhad. Poloměry jsou poloosy elipsy v pixelech.
+## Další parametry
 
-`received_at_unix_s` je čas na počítači po načtení snímku, nikoli hardwarový čas
-expozice; u videa nejde o původní čas natáčení. Číslování začíná při spuštění od 1.
-`geolocation=null`: main zatím nemá připojenou telemetrii ani kalibraci pro výpočet
-zeměpisných souřadnic. JSON není automaticky posílán na notebook přes síť.
+`python3 main.py --help` – zdroj (`--video` záznam, `--image` fotka), pevná kamera
+bez serv (`--fixed-camera 0 0`), výpočet bez hýbání servy (`--dry-run`), rychlost
+serv, vypnutí prohledávání (`--no-scan`), prahy detekce, JSON stavu každého snímku
+(`--output`), `--snapshot foto.jpg`.
 
-V režimu `geometry` se pro malé terče analyzuje dvakrát zvětšený výřez (kratší strana pod 80 px),
-nikoli celý zvětšený obraz. Souřadnice se převádějí zpět do původního rozlišení.
-Minimální plocha čtyřúhelníku je 200 px² a strana 8 px. Vyšší rozlišení může
-zlepšit dosah za cenu času zpracování; zvětšení samo neobnoví chybějící detaily.
-Ověřeno synteticky na terčích šířky 24, 32 a 48 px, nikoli jako garantovaný dosah v metrech.
+## Struktura
 
-Tok programu: `parse_args` → kamera/obraz → `Vision.observe` → `detection_record`
-→ `JSONPublisher` → volitelná vizualizace. Kamera a soubor se zavírají přes ExitStack.
-Režim `--snapshot` zůstává samostatným uložením surové fotografie bez detekčních dat.
-Testy této větve: `python -m unittest discover -s tests -v`.
-
-## Červené tečky a tracking
-
-```bash
-python3 main.py --picamera 0 --detector red --width 1296 --height 972 --status
-```
-
-Výchozí režim je `red`. Bez `--status` vypisuje plný JSON; `--headless` vypne okno.
-Klávesa E přepíná masku. Profil `ov5647_noir.json` nevypíná IR LED.
-Nastavení CSI kamery zůstává zachované. `--tuning-file none` použije systémový profil.
-
-Červená i růžová procházejí společným ověřením velikosti, tvaru a místního kontrastu.
-Větší tečky musí mít eliptický obrys; u několika pixelů nelze tvar spolehlivě určit.
-Detektor vrací všechny kandidáty. Červený tracker používá čas, predikci a adaptivní
-výřez; podobně pravděpodobné cíle hlásí jako `AMBIGUOUS` bez nového platného měření.
-Geometrická detekce celého terče zůstává dostupná přes `--detector geometry`.
-
-`--red-diameter-px 13` je tvrdý filtr velikosti pro obě barvy.
-`--altitude`, případně čerstvá relativní výška z telemetrie, jen upravuje skóre.
-Bez výšky je měřítko neznámé; není dosazena výška 20 m.
-Konfigurovat lze také `--target-diameter-m`, `--hfov-deg` a `--camera-calibration`.
-`--geometry-debug` zapne doplňkovou geometrii okolí kandidáta.
-
-## Data pro řídicí část
-
-Náhled kamery a současně pouze datový kontrakt pro budoucí řízení:
-
-```bash
-python3 main.py --picamera 0 --detector red --width 1296 --height 972 --drone-data
-```
-
-Přidáním `--headless` zůstanou jen data. `--drone-data` nekombinujte s `--status`.
-`--output drone.jsonl` zapíše stejná data do souboru místo terminálu.
-JSON obsahuje platnost/stáří měření, stav, identitu, pixelovou polohu a normalizovanou
-odchylku v souřadnicích obrazu. Neplatná, stará či nejednoznačná měření mají cílovou
-polohu `null`. Plný běžný JSON obsahuje tento kontrakt v položce `drone_data`.
-
-`flight_ready=false`, `flight_command=null`, `world_position=null`: datový výpis
-zatím neodesílá letové povely ani neposkytuje polohu cíle na zemi.
-Podrobnosti a opakovatelné testování: [DETECTION.md](DETECTION.md).
-
-## Struktura po fázi 1
-
-Rozdělení komponent a rozhraní dalších fází popisuje [ARCHITECTURE.md](ARCHITECTURE.md).
-`main.py` nyní pouze načte konfiguraci a spustí aplikaci; stejné příkazy fungují dál.
-Následné změny detekce popisuje DETECTION.md; nastavení kamery zůstává zachované. Letová mise a automatické
-sledování servy zatím implementované nejsou.
-
-## Sledování tečky kamerou
-
-Regulátor je implementovaný. Pro neověřené zapojení použijte výpočet bez pohybu:
-
-```bash
-python3 main.py --picamera 0 --width 1296 --height 972 --track-camera --gimbal-dry-run --status
-```
-
-Detaily zapojení, geometrických předpokladů a aktivace jsou v [DETECTION.md](DETECTION.md).
-
-## Lokalizace tečky
-
-Výpočet GPS a posunu cíle na zemi je nyní zapojen přes `--locate-target`.
-Vyžaduje telemetrii, známou rovinu terče a úhly kamery; nejde o letový povel.
-Konfiguraci a omezení odhadu popisuje [DETECTION.md](DETECTION.md#poloha-tečky-na-zemi).
-
-## Simulace přeletu nad tečku
-
-```bash
-python3 tools/simulate_approach.py --loss 3 7
-```
-
-Samostatná simulace ověřuje přiblížení, zpomalení, zastavení při ztrátě cíle a návrat.
-Není napojená na skutečný dron. SITL spouštěč, omezení a výsledky viz [SIMULATION.md](SIMULATION.md).
-
-## Celá mise – simulační řadič
-
-`python3 tools/run_mission.py --seconds 180` spustí společný řadič od kontroly
-startu přes vzlet a hledání po držení cíle a výstup souřadnic. Podrobný kontrakt,
-scénáře poruch a dosud chybějící části skutečného letu jsou v [MISSION.md](MISSION.md).
+| soubor | co dělá |
+| --- | --- |
+| `main.py` | spuštění |
+| `src/app.py` | hlavní smyčka |
+| `src/aim.py` | **míření: úhel na střed tečky** |
+| `src/locate.py` | **podprogram: souřadnice z polohy dronu a úhlu** |
+| `src/vision.py`, `red_detector.py`, `tracker.py`, `circle_detector.py`, `target_lock.py` | detekce a sledování tečky |
+| `src/gimbal.py`, `gimbal_controller.py` | serva, regulátor míření, prohledávání |
+| `src/geometry.py` | model kamery a úhly |
+| `src/camera.py`, `pi_camera.py`, `sources.py` | kamera |
+| `src/config.py`, `preview.py`, `diagnostics.py` | parametry, okno, ladicí snímky |
+| `calibrate_camera.py`, `tools/calibrate_servos.py` | kalibrace |
+| `tests/` | `python3 -m unittest discover -s tests` |
