@@ -1,5 +1,15 @@
 # Hackathon
 
+## Skutečný let (nové)
+
+`tools/fly_mission.py` spojuje kameru, pásku jako zakázanou zónu, řadič mise a
+ArduPilot. Zapojení, parametry autopilota a postup testování: [FLIGHT.md](FLIGHT.md).
+
+```bash
+python3 tools/fly_mission.py --connect /dev/serial0 --baud 921600 --real-flight --field-bounds -10 10 -10 10
+python3 tools/run_mission.py --tape 5 -12 5 12   # simulace s páskou
+```
+
 ## Ověření bez zasekaného živého okna
 
 ```bash

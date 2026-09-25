@@ -45,6 +45,9 @@ class DetectionPipeline:
         self.config, self.gimbal = config, gimbal
         self.gimbal_controller = None
         self.gimbal_angles = None
+        # Řídí mise: SEARCH = kamera kolmo dolů (stálý záběr pro pásku i hledání),
+        # TRACK = servy centrovat potvrzenou tečku. Bez mise se vždy sleduje.
+        self.camera_mode = 'TRACK'
         self.locator = TargetLocator(config)
         from .boundary_detector import RedWhiteTapeDetector
         self.boundary_detector = RedWhiteTapeDetector() if config.detect_boundary else None
@@ -69,7 +72,12 @@ class DetectionPipeline:
             self.gimbal_angles = GimbalAngles()
         current = GimbalAngles(self.gimbal.x, self.gimbal.y) if self.gimbal else self.gimbal_angles
         command = None
-        if source == 'camera':
+        if self.camera_mode == 'SEARCH':
+            nadir = GimbalAngles(0., 0.)
+            self.gimbal_controller.status = 'NADIR'
+            if (current.right, current.forward) != (0., 0.):
+                command = nadir
+        elif source == 'camera':
             command = self.gimbal_controller.update(observation, current, sample_time=sample_time,
                                                     now=time.monotonic())
         else:

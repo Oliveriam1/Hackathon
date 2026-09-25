@@ -4,10 +4,32 @@ from dataclasses import asdict
 from .approach import TargetEstimate, VehicleState
 from .field import FieldMap, GroundPoint
 from .mission_controller import MissionController, MissionInput, CommandFeedback
+from .tape_mapper import TapeMapper
+
+# Zorné pole OV5647 (geolocation.NOMINAL_FOV), kamera kolmo dolů, horní okraj obrazu = sever.
+HALF_FOV_DEG = (41.4/2, 53.5/2)
+
+
+def footprint(height):
+    """Poloviční rozměr záběru na zemi (sever, východ) v metrech."""
+    return tuple(max(0., height)*math.tan(math.radians(a)) for a in HALF_FOV_DEG)
+
+
+def visible_tape(tape, n, e, height, samples=60):
+    """Část úseku pásky uvnitř záběru kamery, nebo None."""
+    half_n, half_e = footprint(height)
+    (a_n, a_e), (b_n, b_e) = tape
+    inside = [t/samples for t in range(samples+1)
+              if abs(a_n+(b_n-a_n)*t/samples-n) <= half_n and abs(a_e+(b_e-a_e)*t/samples-e) <= half_e]
+    if len(inside) < 2:
+        return None
+    t0, t1 = inside[0], inside[-1]
+    return (GroundPoint(a_n+(b_n-a_n)*t0, a_e+(b_e-a_e)*t0), GroundPoint(a_n+(b_n-a_n)*t1, a_e+(b_e-a_e)*t1))
 
 
 def simulate_mission(settings, *, seconds=300., dt=.05, no_target=False, moving=False,
-                     fault=None, fault_at=20., target_loss=None):
+                     fault=None, fault_at=20., target_loss=None, tapes=(), target_at=(8., 5.),
+                     camera_period=.1):
     if not all(math.isfinite(v) for v in (seconds, dt, fault_at)) or not 0 < seconds <= 3600 or not 0 < dt <= .2:
         raise ValueError('Neplatný čas simulace.')
     if fault not in (None, 'telemetry', 'map', 'camera', 'camera_unlocked', 'manual', 'stop', 'reject_arm', 'no_climb'):
@@ -16,6 +38,8 @@ def simulate_mission(settings, *, seconds=300., dt=.05, no_target=False, moving=
             not all(math.isfinite(t) for t in target_loss) or not 0 <= target_loss[0] < target_loss[1]):
         raise ValueError('Neplatný interval ztráty cíle.')
     mission = MissionController(settings)
+    mapper = TapeMapper()
+    next_frame = 0.
     n = e = height = vn = ve = up = 0.
     guided = armed = taking_off = False
     feedback = None
@@ -25,13 +49,21 @@ def simulate_mission(settings, *, seconds=300., dt=.05, no_target=False, moving=
     for i in range(int(seconds/dt)+1):
         now = i*dt
         n0, n1, e0, e1 = settings.bounds
-        field = FieldMap(tuple(GroundPoint(*p) for p in ((n0, e0), (n1, e0), (n1, e1), (n0, e1))), now)
+        # Kamera dává snímky po camera_period; páska se promítá jen z viditelné části.
+        if now >= next_frame-1e-9:
+            next_frame = now+camera_period
+            if height >= 1.:
+                seen = [v for v in (visible_tape(t, n, e, height) for t in tapes) if v is not None]
+                mapper.update(seen, now)
+        field = FieldMap(tuple(GroundPoint(*p) for p in ((n0, e0), (n1, e0), (n1, e1), (n0, e1))), now,
+                         mapper.lines)
         active_fault = fault if now >= fault_at else None
         if active_fault == 'map':
             field = FieldMap()
-        target_point = GroundPoint(8., 5.+(2*math.sin(now*.2) if moving else 0))
+        target_point = GroundPoint(target_at[0], target_at[1]+(2*math.sin(now*.2) if moving else 0))
+        half_n, half_e = footprint(height)
         visible = (height >= settings.height_m-.2 and not no_target and
-                   math.hypot(target_point.north_m-n, target_point.east_m-e) <= 3 and
+                   abs(target_point.north_m-n) <= half_n and abs(target_point.east_m-e) <= half_e and
                    not (target_loss and target_loss[0] <= now < target_loss[1]))
         target = TargetEstimate(target_point, now, 'simulated-dot', .05) if visible else None
         camera_locked = bool(visible and camera_id == 'simulated-dot' and
@@ -46,6 +78,7 @@ def simulate_mission(settings, *, seconds=300., dt=.05, no_target=False, moving=
                          north_m=n, east_m=e, height_m=height,
                          velocity_north_m_s=vn, velocity_east_m_s=ve, velocity_up_m_s=up,
                          target_visible=visible, camera_locked=camera_locked,
+                         tape_lines=[[l.a.north_m, l.a.east_m, l.b.north_m, l.b.east_m] for l in mapper.lines],
                          distance_m=math.hypot(target_point.north_m-n, target_point.east_m-e),
                          command=asdict(command), mission=mission.snapshot()))
         feedback = None

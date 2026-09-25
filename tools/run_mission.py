@@ -16,7 +16,11 @@ def main():
                         help='Výchozí souřadnice jsou fiktivní, pouze pro simulaci.')
     parser.add_argument('--height', type=float, default=5.)
     parser.add_argument('--field-bounds', nargs=4, type=float, default=(-10., 10., -10., 10.))
-    parser.add_argument('--lane-spacing', type=float, default=4.)
+    parser.add_argument('--lane-spacing', type=float, default=3.)
+    parser.add_argument('--max-speed', type=float, default=1., help='Nejvyšší vodorovná rychlost mise, m/s.')
+    parser.add_argument('--target', nargs=2, type=float, default=(8., 5.), metavar=('NORTH', 'EAST'))
+    parser.add_argument('--tape', nargs=4, type=float, action='append', default=[], metavar=('N1', 'E1', 'N2', 'E2'),
+                        help='Úsek skutečné pásky v simulaci (m od startu); lze opakovat.')
     parser.add_argument('--seconds', type=float, default=300.)
     parser.add_argument('--mission-timeout', type=float, default=600.)
     parser.add_argument('--no-target', action='store_true')
@@ -28,10 +32,11 @@ def main():
     args = parser.parse_args()
     try:
         settings = MissionSettings(StartReference(*args.start), tuple(args.field_bounds),
-                                   args.height, args.lane_spacing, args.mission_timeout)
+                                   args.height, args.lane_spacing, args.mission_timeout, args.max_speed)
         rows = simulate_mission(settings, seconds=args.seconds, no_target=args.no_target,
                                 moving=args.moving, fault=args.fault, fault_at=args.fault_at,
-                                target_loss=args.target_loss)
+                                target_loss=args.target_loss,
+                                tapes=[((t[0], t[1]), (t[2], t[3])) for t in args.tape], target_at=tuple(args.target))
         if args.output:
             with args.output.open('w', encoding='utf-8') as stream:
                 for row in rows:
@@ -47,6 +52,9 @@ def main():
                   f"cil={row['distance_m']:.2f}m duvod={row['command']['reason']}")
             previous, last_report = state, row['time_s']
     print('SIMULACE:', rows[-1]['command']['state'])
+    if rows[-1]['tape_lines']:
+        print('PASKA (sever1, vychod1, sever2, vychod2):', [[round(v, 2) for v in l] for l in rows[-1]['tape_lines']])
+        print(f"nejsevernejsi poloha: {max(r['north_m'] for r in rows):.2f} m")
     if rows[-1]['mission']['target_result']:
         print(json.dumps(rows[-1]['mission']['target_result'], allow_nan=False))
 

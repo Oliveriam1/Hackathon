@@ -77,17 +77,16 @@ Starší `simulate_approach.py` a `run_sitl_approach.py` zůstávají samostatn�
 jednotlivých fází. Nejsou backendy nového řadiče. Produkční backend musí číst
 potvrzení ze správného autopilota, převést jednorázové záměry na odpovídající
 povely, zpracovat odmítnutí, ověřit režim a stav, pravidelně obnovovat rychlostní
-povely a vždy respektovat `RELEASE`. Nový backend zatím implementovaný není.
+povely a vždy respektovat `RELEASE`. Tento backend je v `mavlink_backend.py`.
 
-## Co brání dokončení skutečné autonomní mise
+## Skutečný let a páska
 
-Pi zatím není připojené k autopilotu. Čeká se na jeho typ, firmware, MAVLink
-endpoint a baudrate; následně je nutný integrační test a ověření reakcí stroje.
-Zapojení, znaménka, rozsahy a skutečné úhly serv stále nejsou ověřené.
+MAVLink backend (`mavlink_backend.py`), hlavní smyčka (`flight_runner.py`,
+`tools/fly_mission.py`) a mapování pásky (`tape_mapper.py`) jsou hotové, viz
+[FLIGHT.md](FLIGHT.md). Páska se promítá na zem a po dvou snímcích vznikne
+zakázaná čára (`FieldMap.forbidden_lines`), kterou hlídá `ZoneGuard` i ořez
+trasy. Simulace: `python3 tools/run_mission.py --tape N1 E1 N2 E2`.
+Rychlost mise je omezena dohledem kamery na pásku (`tape_safe_speed`).
 
-Z rozpoznané pásky zatím nevzniká časově sladěná, uzavřená mapa v metrech.
-Plánovač nyní přijímá pouze explicitní obdélník; nedokáže zmapovat neznámé pole
-ani pokrýt obecný polygon. Neznámá mapa blokuje start. To je dosud nesplněná
-část původní pipeline, nikoliv funkce, kterou zapne pouhé připojení kabelu.
-Je nutné doplnit mapování podle popisu v BOUNDARY.md, ověřit projekci a nejistoty
-a propojit jej s řadičem. Současný stav nelze označit za hotový autonomní let.
+Stále chybí: ověření v ArduPilot SITL na vašem stroji, skutečné zapojení
+a ladění prahů detekce na reálném poli.

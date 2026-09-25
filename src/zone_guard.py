@@ -1,4 +1,4 @@
-"""Konzervativní kontrola ověřené konvexní mapy v metrech. Bez letových povelů."""
+"""Konzervativní kontrola ověřené konvexní mapy a pásky v metrech. Bez letových povelů."""
 import math
 from dataclasses import dataclass
 
@@ -47,6 +47,14 @@ class ZoneGuard:
             if any(side(p) < -1e-8 for p in points):
                 return ZoneDecision(False, 'ZONE_NONCONVEX')
             clearance = min(clearance, side(vehicle.position))
+        # Páska: každá čára je další hrana konvexní oblasti (polorovina se startem).
+        for line in field.forbidden_lines:
+            if not all(math.isfinite(v) for v in (line.a.north_m, line.a.east_m, line.b.north_m, line.b.east_m)):
+                return ZoneDecision(False, 'ZONE_INVALID_DATA')
+        tape = field.line_clearance(vehicle.position)
+        if tape < 0:
+            return ZoneDecision(False, 'ZONE_BEYOND_TAPE', tape)
+        clearance = min(clearance, tape)
         # Obal brzdné dráhy ve všech směrech: nezávisí na natočení kamery.
         speed = max(math.hypot(vehicle.velocity_north, vehicle.velocity_east),
                     math.hypot(command.north_m_s, command.east_m_s))

@@ -15,14 +15,19 @@ class MissionSettings:
     start: StartReference
     bounds: tuple[float, float, float, float]
     height_m: float = 5.
-    lane_spacing_m: float = 4.
+    lane_spacing_m: float = 3.
     timeout_s: float = 600.
+    # Při kameře kolmo dolů vidí dron pásku jen ~1.9 m dopředu (5 m, OV5647).
+    # Rychlost musí dovolit zastavit před ní: rezerva + reakce + brzdná dráha.
+    max_speed_m_s: float = 1.
 
     def __post_init__(self):
         if (not math.isfinite(self.timeout_s) or self.timeout_s <= 0 or
                 not math.isfinite(self.start.latitude_deg) or abs(self.start.latitude_deg) >= 89.9 or
                 not math.isfinite(self.start.longitude_deg)):
             raise ValueError('Neplatná reference nebo timeout mise.')
+        if not math.isfinite(self.max_speed_m_s) or not 0 < self.max_speed_m_s <= 2:
+            raise ValueError('Rychlost mise musí být v rozsahu (0, 2] m/s.')
         TakeoffController(self.height_m)
         RectangleSweep(self.bounds, spacing=self.lane_spacing_m)
 
@@ -65,6 +70,23 @@ class MissionCommand:
     target_id: str | None = None
 
 
+# Kratší polovina záběru OV5647 kolmo dolů (vertikální FOV 41.4°).
+TAPE_LOOKAHEAD_TAN = math.tan(math.radians(41.4/2))
+
+
+def tape_safe_speed(height_m, *, margin=.5, reaction_s=.5, acceleration=1.):
+    """Nejvyšší rychlost, při které dron zastaví před páskou, kterou uvidí až na okraji záběru.
+
+    reaction_s zahrnuje reakci autopilota i potvrzení čáry ze dvou snímků.
+    """
+    lookahead = height_m*TAPE_LOOKAHEAD_TAN
+    room = lookahead-margin
+    if room <= 0:
+        return 0.
+    ar = acceleration*reaction_s
+    return math.sqrt(ar*ar+2*acceleration*room)-ar
+
+
 class MissionController:
     def __init__(self, settings=None):
         self.settings = settings
@@ -80,6 +102,9 @@ class MissionController:
         self.takeoff = TakeoffController(settings.height_m) if settings else None
         self.guard = ZoneGuard()
         self.airborne = False
+        self.last_tape_lines = ()
+        self.speed_cap = (min(settings.max_speed_m_s, max(.2, tape_safe_speed(settings.height_m)))
+                          if settings else None)
 
     def snapshot(self):
         return dict(enabled=self.settings is not None, state=self.state, reason=self.reason,
@@ -87,6 +112,7 @@ class MissionController:
                     waypoint_index=self.search.index if self.search else None,
                     waypoint_count=len(self.search.sweep.points) if self.search else None,
                     target_result=self.last_result, flight_ready=False,
+                    tape_lines=len(self.last_tape_lines), speed_cap_m_s=self.speed_cap,
                     execution='controller_only_no_hardware')
 
     def output(self, reason, **kwargs):
@@ -138,12 +164,22 @@ class MissionController:
                 return self.fail('ARMED_LOST')
             if not data.camera_ready:
                 return self.fail('CAMERA_UNAVAILABLE')
+        self.last_tape_lines = data.field.forbidden_lines
         zone = self.guard.check(data.field, data.vehicle, ApproachCommand('HOLD'), now)
         self.zone_state = zone.state
         if not zone.allowed:
             if self.state == 'PREFLIGHT':
                 return self.output(zone.state)
             # Brzdění je obnovitelné; neznámá/stará mapa nebo opuštění pole je chyba.
+            if zone.state == 'ZONE_BEYOND_TAPE' and self.airborne:
+                # Páska rozpoznaná až za dronem: pomalu zpět kolmo k ní, ne failsafe.
+                line = min(data.field.forbidden_lines, key=lambda l: l.signed_distance(data.vehicle.position))
+                dn, de = line.inward()
+                self.search.controller.hold(zone.state)
+                self.search.controller.last_time = now
+                self.state = 'TAPE_RETREAT'
+                return self.output(zone.state, action='VELOCITY', north_m_s=.5*dn, east_m_s=.5*de,
+                                   height_setpoint_m=self.settings.height_m)
             if zone.state == 'ZONE_BRAKE' and self.airborne:
                 self.search.controller.hold(zone.state)
                 self.search.controller.last_time = now
@@ -211,8 +247,8 @@ class MissionController:
         room = max(0., zone.clearance_m-self.guard.margin-.15)
         ar = self.guard.acceleration*self.guard.reaction_time
         speed_limit = math.sqrt(ar*ar+2*self.guard.acceleration*room)-ar
-        self.search.controller.speed = min(2., max(.01, speed_limit))
-        command = self.search.update(data.vehicle, data.target, now)
+        self.search.controller.speed = min(self.speed_cap, max(.01, speed_limit))
+        command = self.search.update(data.vehicle, data.target, now, data.field)
         zone = self.guard.check(data.field, data.vehicle, command, now)
         self.zone_state = zone.state
         if not zone.allowed:
