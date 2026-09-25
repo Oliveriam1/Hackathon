@@ -643,6 +643,18 @@ def run(args):
                 fps = 0.9 * fps + 0.1 / dt
             if args.show:
                 view = frame.copy()
+
+                # Display-only colour correction for the NoIR camera:
+                # pixels that already satisfy the tracker's red criteria are shown
+                # as true red. Detection itself still uses the untouched camera frame.
+                vb, vg, vr = cv2.split(view)
+                vred = cv2.subtract(vr, cv2.max(vg, vb))
+                _, vm1 = cv2.threshold(vred, REDNESS_MIN, 255, cv2.THRESH_BINARY)
+                _, vm2 = cv2.threshold(vr, R_MIN, 255, cv2.THRESH_BINARY)
+                vm3 = cv2.compare(vred, cv2.convertScaleAbs(vr, alpha=RED_FRACTION_MIN), cv2.CMP_GT)
+                preview_red_mask = cv2.bitwise_and(cv2.bitwise_and(vm1, vm2), vm3)
+                view[preview_red_mask != 0] = (0, 0, 255)
+
                 cv2.drawMarker(view, (W // 2, H // 2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
                 if det is not None:
                     c = (int(det["x"]), int(det["y"]))
