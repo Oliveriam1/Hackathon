@@ -20,13 +20,24 @@ Detection (v3)
   * While tracking, the size filter follows the disc's own last size, so it keeps working
     when the disc gets closer/further or tilts. The altitude-based size is used only to
     find it the first time.
-  * Edge-based recovery near the last position still requires target colour.
+  * If colour briefly fails (glare, shadow) a shape-only check near the last position
+    keeps the track alive.
 
 Control (v3)
   * Latency-compensated: each frame's error is added to the gimbal angle AT THE TIME THE
     FRAME WAS TAKEN (not the current one). This removes the overshoot/oscillation caused by
     camera + servo delay, so the gimbal settles and LOCK is reached.
   * Lock with hysteresis and a short coast period, so one bad frame doesn't drop the lock.
+
+Servo -> image calibration (v4)
+  * The tracker no longer ASSUMES which servo moves the picture which way. On the first
+    detection it nudges each servo by a few degrees, watches where the disc moves in the
+    image, and works out: axes swapped?  direction inverted?  degrees-per-degree scale?
+    The result is saved to gimbal_calibration.json and loaded on the next start.
+    (Wrong sign or swapped axes = positive feedback = the gimbal runs away forever.)
+  * Runaway guard: if the error keeps growing or the gimbal sits on its limit while the
+    target is still off-centre, tracking pauses and the calibration is re-done.
+  * The tracking window is predicted from the gimbal motion, so fast moves don't lose it.
 
 Gimbal geometry ("X/Y" roll/pitch gimbal, camera straight down at 0/0):
   X axis = tilts camera to the drone's RIGHT (+),  Y axis = tilts camera FORWARD (+).
@@ -38,15 +49,19 @@ Install on the Pi:
 
 Run:
     python3 red_tracker.py                      # full system (drone)
-    python3 red_tracker.py --bench 1.5 --show --debug  # desk test, servos held at 0/0
+    python3 red_tracker.py --bench 1.5 --show   # desk test: printed disc ~1.5 m from camera
     python3 red_tracker.py --bench 1.5 --show --no-servo   # desk test, gimbal not moved
     python3 red_tracker.py --tune               # colour sliders (desktop / VNC)
     python3 red_tracker.py --sim 52 6           # simulation, no hardware
     python3 red_tracker.py --sim 30.3 15.2 --bench 1.5 --tilt 60 --show   # simulated desk test
+    python3 red_tracker.py --bench 1.5 --show --calibrate   # force a new servo calibration
+    python3 red_tracker.py --sim 30.3 15.2 --bench 1.5 --sim-swap --sim-invert-x  # miswired sim
 """
 
 import argparse
+import json
 import math
+import os
 import time
 from collections import deque
 
@@ -73,7 +88,7 @@ RB_TOL = 40             # R >= B - this   (rejects blue/purple)
 MIN_AREA_PX = 3
 SMALL_BLOB_PX = 10          # below this size only a basic aspect check is possible
 MAX_ASPECT = 4.5            # ellipse major/minor; 4.5 = disc tilted ~77 deg
-MIN_ELLIPSE_IOU = 0.90      # full silhouette union; rectangles score about 0.82
+MIN_ELLIPSE_IOU = 0.72      # filled silhouette vs its fitted ellipse
 MIN_SOLIDITY = 0.85
 MIN_COLOUR_COVERAGE = 0.45  # coloured pixels / silhouette (glare holes allowed)
 SEARCH_SIZE_RATIO = (0.3, 3.0)   # vs altitude-based expected size (first detection)
@@ -94,6 +109,18 @@ X_DIR, Y_DIR = 1, 1
 X_LIMITS = (-60.0, 60.0)
 Y_LIMITS = (-45.0, 45.0)
 SERVO_LAG_S = 0.15          # time for a small servo move to complete
+RAW_LIMIT_DEG = 90.0        # hard limit of each servo command (500..2500 us)
+
+# --- servo -> image calibration ---
+CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gimbal_calibration.json")
+CAL_STEP_DEG = 5.0          # test nudge per servo
+CAL_SETTLE_S = 0.6          # wait after each nudge
+CAL_FLUSH_FRAMES = 2        # stale frames dropped after a move
+CAL_MEASURE_FRAMES = 3      # frames averaged per measurement
+CAL_MIN_RESPONSE = 0.25     # image must move >= 25 % of the commanded angle
+CAL_MAX_SCALE = 3.0
+RUNAWAY_GROW_FRAMES = 4     # error grew this many frames in a row -> runaway
+RUNAWAY_LIMIT_FRAMES = 6    # gimbal pushed into its limit this many frames -> runaway
 
 # --- control ---
 K_TRACK = 0.7               # fraction of the (latency-compensated) error corrected per frame
@@ -176,17 +203,20 @@ def slant_range(ax, ay, h):
 
 
 def expected_diameter_px(ax, ay, h):
-    """Expected major diameter in original pixels; h is AGL (bench: axial distance).
-
-    At 0/0 and 1.5 m a 0.20 m disc spans about 170 x 173 pixels.
-    detect() scales both this reference and the image by DETECT_FULL_SCALE.
-    """
-    return max(F_X, F_Y) * TARGET_DIAMETER_M / slant_range(ax, ay, h)
+    return F_X * TARGET_DIAMETER_M / slant_range(ax, ay, h)
 
 
 def pixel_error_to_angles(dx, dy):
     """Pixel offset from centre -> angular offset (deg), right/down positive."""
     return math.degrees(math.atan(dx / F_X)), math.degrees(math.atan(dy / F_Y))
+
+
+def angles_to_pixel(err_x, err_y, gy, W, H):
+    """Inverse of the tracker's error model: physical error (deg) -> expected image pixel."""
+    ex = err_x * math.cos(math.radians(gy))
+    ey = -err_y
+    ex, ey = max(-80.0, min(80.0, ex)), max(-80.0, min(80.0, ey))
+    return W / 2 + F_X * math.tan(math.radians(ex)), H / 2 + F_Y * math.tan(math.radians(ey))
 
 
 def build_search_grid(st):
@@ -225,9 +255,7 @@ class Camera:
             tuning = Picamera2.load_tuning_file(TUNING_FILE) if TUNING_FILE else None
             self.cam = Picamera2(tuning=tuning)
             cfg = self.cam.create_video_configuration(
-                # Picamera2 manual: RGB888 arrays contain [B,G,R]; no channel swap.
-                # https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf
-                main={"size": (CAPTURE_W, CAPTURE_H), "format": "RGB888"},
+                main={"size": (CAPTURE_W, CAPTURE_H), "format": "RGB888"},  # BGR order in numpy
                 transform=Transform(hflip=CAM_ROTATE_180, vflip=CAM_ROTATE_180),
                 buffer_count=2)
             self.cam.configure(cfg)
@@ -252,50 +280,105 @@ class Camera:
 
 
 class Gimbal:
-    """x, y = commanded PHYSICAL angles (deg): x = right, y = forward, 0/0 = straight down.
+    """x, y = PHYSICAL camera angles (deg): x = right, y = forward, 0/0 = straight down.
+    cx, cy = RAW servo commands (deg from centre) sent to X_PIN / Y_PIN.
+    physical = P @ raw, with P from the servo calibration (identity = wired as designed;
+    a swapped or inverted servo shows up as off-diagonal / negative entries).
     Keeps a short command history so the controller can ask where the gimbal actually
     pointed when a given frame was captured (servo + camera latency compensation).
-    frozen=True (--no-servo): no hardware writes. hold_zero=True (--bench):
-    command calibrated neutral once, then keep both angles at 0/0."""
+    frozen=True (--no-servo): angles never change, so the measured error stays honest."""
 
-    def __init__(self, hardware=True, frozen=False, hold_zero=False):
+    def __init__(self, hardware=True, frozen=False, mapping=None):
         self.x = self.y = 0.0
-        self.frozen = frozen or hold_zero
+        self.cx = self.cy = 0.0
+        self.P = np.eye(2)
+        self.Pinv = np.eye(2)
+        self.frozen = frozen
         self.pi = None
         self.hist = deque(maxlen=200)
-        self.hist.append((0.0, 0.0, 0.0))
         if hardware and not frozen:
             import pigpio
             self.pi = pigpio.pi()
             if not self.pi.connected:
                 raise RuntimeError("pigpiod not running: sudo systemctl start pigpiod")
+        if mapping is not None:
+            self.set_mapping(mapping)
+        self.reset_history()
         self._write()
 
+    # --- mapping ---
+    def set_mapping(self, P):
+        P = np.asarray(P, dtype=float).reshape(2, 2)
+        if abs(np.linalg.det(P)) < 1e-3:
+            raise ValueError("singular gimbal mapping")
+        self.P, self.Pinv = P, np.linalg.inv(P)
+        self.x, self.y = (float(v) for v in self.P @ (self.cx, self.cy))
+        self.reset_history()
+
+    def reset_history(self):
+        self.hist.clear()
+        self.hist.append((0.0, self.x, self.y, self.cx, self.cy))
+
+    # --- moves ---
     def move_to(self, x, y):
+        """Move to PHYSICAL angles (clamped to X_LIMITS / Y_LIMITS)."""
         if self.frozen:
             return
-        self.x = max(X_LIMITS[0], min(X_LIMITS[1], x))
-        self.y = max(Y_LIMITS[0], min(Y_LIMITS[1], y))
-        self.hist.append((time.time(), self.x, self.y))
-        self._write()
+        p = np.array([max(X_LIMITS[0], min(X_LIMITS[1], x)),
+                      max(Y_LIMITS[0], min(Y_LIMITS[1], y))])
+        c = self.Pinv @ p
+        self._set(c[0], c[1])
 
     def move_by(self, dx, dy):
         self.move_to(self.x + dx, self.y + dy)
 
+    def set_raw(self, cx, cy):
+        """Send RAW servo commands (deg), bypassing the mapping (used by calibration)."""
+        if self.frozen:
+            return
+        self._set(cx, cy)
+
+    def _set(self, cx, cy):
+        self.cx = max(-RAW_LIMIT_DEG, min(RAW_LIMIT_DEG, float(cx)))
+        self.cy = max(-RAW_LIMIT_DEG, min(RAW_LIMIT_DEG, float(cy)))
+        self.x, self.y = (float(v) for v in self.P @ (self.cx, self.cy))
+        self.hist.append((time.time(), self.x, self.y, self.cx, self.cy))
+        self._write()
+
+    def at_limit(self, axis, direction):
+        """True if a PHYSICAL axis (0=x, 1=y) can't move further in `direction`."""
+        lim = X_LIMITS if axis == 0 else Y_LIMITS
+        v = self.x if axis == 0 else self.y
+        if (direction > 0 and v >= lim[1] - 0.5) or (direction < 0 and v <= lim[0] + 0.5):
+            return True
+        # also blocked if the servo feeding this axis is on its raw limit
+        c = np.array([self.cx, self.cy])
+        dc = self.Pinv @ (np.eye(2)[axis] * direction)
+        return any(abs(c[i]) >= RAW_LIMIT_DEG - 0.5 and c[i] * dc[i] > 1e-6 for i in range(2))
+
+    # --- history ---
+    def _entry_at(self, t, lag):
+        t -= SERVO_LAG_S if lag is None else lag
+        e = self.hist[0]
+        for h in self.hist:
+            if h[0] > t:
+                break
+            e = h
+        return e
+
     def angle_at(self, t, lag=None):
         """Physical angle at time t: the command that was active SERVO_LAG_S earlier."""
-        t -= SERVO_LAG_S if lag is None else lag
-        ax, ay = self.hist[0][1], self.hist[0][2]
-        for ts, hx, hy in self.hist:
-            if ts > t:
-                break
-            ax, ay = hx, hy
-        return ax, ay
+        e = self._entry_at(t, lag)
+        return e[1], e[2]
+
+    def raw_at(self, t, lag=None):
+        e = self._entry_at(t, lag)
+        return e[3], e[4]
 
     def _write(self):
         if self.pi:
-            px = X_CENTER_US + X_DIR * self.x * US_PER_DEG
-            py = Y_CENTER_US + Y_DIR * self.y * US_PER_DEG
+            px = X_CENTER_US + X_DIR * self.cx * US_PER_DEG
+            py = Y_CENTER_US + Y_DIR * self.cy * US_PER_DEG
             self.pi.set_servo_pulsewidth(X_PIN, int(max(500, min(2500, px))))
             self.pi.set_servo_pulsewidth(Y_PIN, int(max(500, min(2500, py))))
 
@@ -315,8 +398,10 @@ class SimCamera:
     SIM_TRUE_DELAY_S = 0.20     # real (unknown) servo + camera delay; deliberately != config
 
     def __init__(self, gimbal, target_xy, tilt=0.0, pink=False, glare=False,
-                 decoy_xy=(15.0, 22.0)):
+                 decoy_xy=(15.0, 22.0), hw_mapping=None):
         self.g, self.target, self.decoy = gimbal, target_xy, decoy_xy
+        # TRUE hardware: physical = hw_mapping @ raw servo command (unknown to the tracker)
+        self.hw = np.eye(2) if hw_mapping is None else np.asarray(hw_mapping, float)
         self.tilt, self.pink, self.glare = tilt, pink, glare
         rng = np.random.default_rng(1)
         blotch = cv2.resize(rng.normal(0, 14, (CAPTURE_H // 40, CAPTURE_W // 40)), (CAPTURE_W, CAPTURE_H))
@@ -349,7 +434,8 @@ class SimCamera:
             time.sleep(wait)
         self.t_last = time.time()
         st = get_drone_state()
-        ang = self.g.angle_at(time.time(), lag=self.SIM_TRUE_DELAY_S)
+        raw = self.g.raw_at(time.time(), lag=self.SIM_TRUE_DELAY_S)
+        ang = tuple(float(v) for v in self.hw @ raw)
         img = self.bg.copy()
         dx, dy = self.decoy
         self._fill(img, self._project([(dx, dy), (dx + 4.5, dy), (dx + 4.5, dy + 1.8), (dx, dy + 1.8)], st, ang),
@@ -387,11 +473,11 @@ def colour_mask(img):
     return m
 
 
-def _ellipse_check(contour, bw, bh, ox, oy, diagnostics=None):
+def _ellipse_check(contour, bw, bh, ox, oy):
     """Shape test on a closed contour (coordinates relative to ox, oy).
     Returns dict(major, minor, cx, cy, iou, angle, sil) or None if it isn't ellipse-like."""
     area = abs(cv2.contourArea(contour))
-    if max(bw, bh) < SMALL_BLOB_PX:
+    if max(bw, bh) < SMALL_BLOB_PX or len(contour) < 5:
         # tiny blob: only size/aspect are meaningful
         major, minor = float(max(bw, bh)), float(max(1, min(bw, bh)))
         if major / minor > MAX_ASPECT:
@@ -403,9 +489,6 @@ def _ellipse_check(contour, bw, bh, ox, oy, diagnostics=None):
             cx, cy = bw / 2.0, bh / 2.0
         return dict(major=major, minor=minor, cx=cx + ox, cy=cy + oy, iou=0.85, angle=0.0, sil=None)
 
-    if len(contour) < 5:
-        return None  # A large four-vertex rectangle is not a tiny unresolved disc.
-
     (ex, ey), (ew, eh), ang = cv2.fitEllipse(contour)
     major, minor = max(ew, eh), min(ew, eh)
     major_angle = ang + 90.0 if ew < eh else ang     # orientation of the major axis
@@ -416,22 +499,10 @@ def _ellipse_check(contour, bw, bh, ox, oy, diagnostics=None):
         return None
     sil = np.zeros((bh, bw), np.uint8)
     cv2.drawContours(sil, [contour], -1, 255, cv2.FILLED)          # fills glare holes
-    # Include the COMPLETE fitted ellipse. Clipping it to the blob's bounding
-    # box hid the oversized ellipse outside rectangular blobs and inflated IoU.
-    theta = math.radians(ang)
-    rx = math.hypot(ew / 2 * math.cos(theta), eh / 2 * math.sin(theta))
-    ry = math.hypot(ew / 2 * math.sin(theta), eh / 2 * math.cos(theta))
-    left, top = min(0, math.floor(ex - rx) - 1), min(0, math.floor(ey - ry) - 1)
-    right, bottom = max(bw, math.ceil(ex + rx) + 2), max(bh, math.ceil(ey + ry) + 2)
-    if right - left > 3 * bw or bottom - top > 3 * bh:
-        return None  # Degenerate fit; avoid an unbounded temporary allocation.
-    ell = np.zeros((bottom - top, right - left), np.uint8)
-    cv2.ellipse(ell, ((ex - left, ey - top), (ew, eh), ang), 255, cv2.FILLED)
-    intersection = cv2.countNonZero(sil & ell[-top:bh - top, -left:bw - left])
-    union = cv2.countNonZero(sil) + cv2.countNonZero(ell) - intersection
-    iou = intersection / float(union) if union else 0.0
-    if diagnostics is not None:
-        diagnostics["best_shape"] = max(diagnostics.get("best_shape", 0.0), iou)
+    ell = np.zeros((bh, bw), np.uint8)
+    cv2.ellipse(ell, ((ex, ey), (ew, eh), ang), 255, cv2.FILLED)
+    union = cv2.countNonZero(sil | ell)
+    iou = cv2.countNonZero(sil & ell) / float(union) if union else 0.0
     if iou < MIN_ELLIPSE_IOU:
         return None
     return dict(major=major, minor=minor, cx=ex + ox, cy=ey + oy, iou=iou, angle=major_angle, sil=sil)
@@ -447,8 +518,65 @@ def _score(c, size_ref, size_range, prefer, prefer_scale):
     return cost
 
 
-def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO, shape_fallback=False,
-           diagnostics=None):
+
+def _shape_candidates(img, ref, size_range, prefer=None, prefer_scale=1.0):
+    """Yield ellipse-like contours independent of colour.
+
+    Used as a fallback in SEARCH/bench and TRACK. The expected 200 mm target
+    size still constrains the candidate, so arbitrary circles in the scene are
+    not accepted without limit.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 45, 135)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, MORPH_KERNEL_3)
+
+    cnts, _ = cv2.findContours(
+        edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
+    )
+
+    out = []
+    for cnt in cnts:
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        major_bb = max(bw, bh)
+        minor_bb = max(1, min(bw, bh))
+
+        if major_bb < max(SMALL_BLOB_PX, size_range[0] * ref * 0.65):
+            continue
+        if major_bb > size_range[1] * ref * 1.35:
+            continue
+        if major_bb / float(minor_bb) > MAX_ASPECT:
+            continue
+
+        per = cv2.arcLength(cnt, True)
+        if per <= 0:
+            continue
+
+        # Reject obvious rectangles/squares and jagged reflections.
+        approx = cv2.approxPolyDP(cnt, 0.02 * per, True)
+        if len(approx) < 6:
+            continue
+
+        local = cnt - np.array([bx, by])
+        c = _ellipse_check(local, bw, bh, bx, by)
+        if c is None:
+            continue
+
+        # Shape-only candidates should match the fitted ellipse very well.
+        if c["iou"] < max(MIN_ELLIPSE_IOU, 0.80):
+            continue
+
+        cost = _score(c, ref, size_range, prefer, prefer_scale)
+        if cost is None:
+            continue
+
+        c["source"] = "shape"
+        out.append((cost, c))
+
+    return out
+
+
+def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO, shape_fallback=False):
     """Find the red/pink disc (circle or tilted ellipse).
 
     size_ref   : expected major-axis size in px (altitude-based in SEARCH, last size in TRACK)
@@ -473,12 +601,6 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
     k = 5 if ref > 40 else 3                       # bridge small glare gaps on big discs
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if diagnostics is not None:
-        diagnostics["blobs"] = diagnostics.get("blobs", 0) + n - 1
-
-    def rejected(stage):
-        if diagnostics is not None:
-            diagnostics[stage] = diagnostics.get(stage, 0) + 1
 
     best, best_cost = None, float("inf")
     for i in range(1, n):
@@ -487,76 +609,45 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
             continue
         major_bb = max(bw, bh)
         if major_bb < size_range[0] * ref * 0.7 or min(bw, bh) > size_range[1] * ref * 1.3:
-            rejected("reject_size")
             continue                               # cheap size pre-filter
         comp = (labels[by:by + bh, bx:bx + bw] == i).astype(np.uint8) * 255
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not cnts:
             continue
         cnt = max(cnts, key=cv2.contourArea)
-        c = _ellipse_check(cnt, bw, bh, bx, by, diagnostics)
+        c = _ellipse_check(cnt, bw, bh, bx, by)
         if c is None:
-            rejected("reject_shape")
             continue
-        cover = 1.0
         if c["sil"] is not None:
             cover = cv2.countNonZero(comp & c["sil"]) / float(max(1, cv2.countNonZero(c["sil"])))
             if cover < MIN_COLOUR_COVERAGE:
-                rejected("reject_colour")
                 continue
-        c["coverage"] = cover
         cost = _score(c, ref, size_range, pref, pscale)
-        if cost is None:
-            rejected("reject_size")
-        else:
-            rejected("detected_candidates")
         if cost is not None and cost < best_cost:
             best_cost, best, c["source"] = cost, c, "colour"
 
-    # Edge recovery may bridge glare, but must still satisfy the colour rule.
-    if best is None and shape_fallback and pref is not None:
-        gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-        edges = cv2.dilate(cv2.Canny(gray, 40, 120), MORPH_KERNEL_3)
-        cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)   # LIST: inner shapes too
-        for cnt in cnts:
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            if max(bw, bh) < max(SMALL_BLOB_PX, 0.5 * ref) or max(bw, bh) > 2.0 * ref:
-                continue
-            local = cnt - np.array([bx, by])
-            c = _ellipse_check(local, bw, bh, bx, by, diagnostics)
-            if c is None or math.hypot(c["cx"] - pref[0], c["cy"] - pref[1]) > 1.0 * ref:
-                continue
-            cover = cv2.countNonZero(mask[by:by + bh, bx:bx + bw] & c["sil"]) / float(max(1, cv2.countNonZero(c["sil"])))
-            if cover < MIN_COLOUR_COVERAGE:
-                rejected("reject_colour")
-                continue
-            c["coverage"] = cover
-            cost = _score(c, ref, (0.6, 1.6), pref, pscale)
-            if cost is None:
-                rejected("reject_size")
-            else:
-                rejected("detected_candidates")
-            if cost is not None and cost < best_cost:
-                best_cost, best, c["source"] = cost, c, "shape"
+    # Shape fallback:
+    # - in TRACK, keep the target alive when colour is lost by glare/shadow;
+    # - in SEARCH/bench, allow a clearly round 200 mm surface to be acquired
+    #   even when the NoIR colour rendering is poor.
+    use_shape = shape_fallback or (roi is None)
+    if best is None and use_shape:
+        shape_range = (0.45, 1.8) if (shape_fallback and pref is not None) else size_range
+        for cost, c in _shape_candidates(
+                img, ref, shape_range, prefer=pref, prefer_scale=pscale):
+            if pref is not None:
+                if math.hypot(c["cx"] - pref[0], c["cy"] - pref[1]) > 1.25 * max(ref, 1.0):
+                    continue
+            if cost < best_cost:
+                best_cost, best = cost, c
 
     if best is None:
         return None, mask
     inv = 1.0 / scale
-    if diagnostics is not None:
-        diagnostics.update(best_size=best["major"] * inv, best_shape=best["iou"], best_colour=best["coverage"])
     return dict(x=x0 + best["cx"] * inv, y=y0 + best["cy"] * inv,
                 w=best["major"] * inv, h=best["minor"] * inv,
                 tilt=math.degrees(math.acos(min(1.0, best["minor"] / max(best["major"], 1e-6)))),
                 angle=best["angle"], source=best["source"]), mask
-
-
-def fill_confirmed_target(view, det, scale):
-    """Only annotate the display copy, and only the selected detector result."""
-    if det is not None:
-        center = (int(round(det["x"] * scale)), int(round(det["y"] * scale)))
-        axes = (max(1, int(round(det["w"] * scale / 2))),
-                max(1, int(round(det["h"] * scale / 2))))
-        cv2.ellipse(view, center, axes, det["angle"], 0, 360, (0, 0, 255), cv2.FILLED)
 
 
 def normalize_rect_angle(rect):
@@ -709,6 +800,153 @@ def analyze_object_geometry(frame, prefer=None):
 
 
 
+# --------------------------- servo calibration ---------------------------
+_DIR_NAMES = {(0, 1): "RIGHT", (0, -1): "LEFT", (1, 1): "FORWARD (image up)", (1, -1): "BACK (image down)"}
+
+
+def _describe(col):
+    ax = 0 if abs(col[0]) >= abs(col[1]) else 1
+    return _DIR_NAMES[(ax, 1 if col[ax] > 0 else -1)], abs(col[ax])
+
+
+def load_calibration(path=CALIB_FILE):
+    try:
+        with open(path) as f:
+            P = np.array(json.load(f)["P"], dtype=float).reshape(2, 2)
+        if abs(np.linalg.det(P)) < 1e-3:
+            raise ValueError("singular")
+        return P
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[calib] ignoring {path}: {e}")
+        return None
+
+
+def save_calibration(P, path=CALIB_FILE):
+    try:
+        with open(path, "w") as f:
+            json.dump({"P": np.asarray(P).tolist(), "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "note": "physical(right, forward) = P @ raw servo command (X_PIN, Y_PIN)"},
+                      f, indent=2)
+        print(f"[calib] saved to {path}")
+    except OSError as e:
+        print(f"[calib] could not save {path}: {e}")
+
+
+def _measure(cam, size_ref, prefer):
+    """Average target image angle (deg, right/down +) over a few fresh frames."""
+    for _ in range(CAL_FLUSH_FRAMES):
+        cam.read()
+    pts, sizes = [], []
+    for _ in range(CAL_MEASURE_FRAMES):
+        frame = cam.read()
+        if frame is None:
+            continue
+        H, W = frame.shape[:2]
+        det, _ = detect(frame, size_ref, prefer=prefer, size_range=TRACK_SIZE_RATIO)
+        if det is None:
+            continue
+        ex, ey = pixel_error_to_angles(det["x"] - W / 2, det["y"] - H / 2)
+        pts.append((ex, ey, det["x"], det["y"]))
+        sizes.append(det["w"])
+    if len(pts) < max(1, CAL_MEASURE_FRAMES - 1):
+        return None
+    a = np.mean(pts, axis=0)
+    return dict(e=a[:2], px=(a[2], a[3]), size=float(np.mean(sizes)))
+
+
+def calibrate_gimbal(cam, gimbal, size_ref, prefer):
+    """Nudge each servo, watch where the target moves in the image, and return the
+    2x2 matrix P with  physical(right, forward) = P @ raw servo command,  or None.
+
+    Image model (same as the tracker): turning the camera RIGHT by d moves the target
+    LEFT in the image by d; turning it FORWARD by d moves the target DOWN by d.
+    """
+    print("[calib] measuring servo -> image mapping (keep the target still) ...")
+    c0 = (gimbal.cx, gimbal.cy)
+
+    def goto(c):
+        gimbal.set_raw(*c)
+        time.sleep(CAL_SETTLE_S)
+
+    goto(c0)
+    base = _measure(cam, size_ref, prefer)
+    if base is None:
+        print("[calib] target not visible at start - calibration skipped")
+        return None
+    cols = []
+    for axis, name in ((0, f"X servo (pin {X_PIN})"), (1, f"Y servo (pin {Y_PIN})")):
+        col = None
+        for step in (CAL_STEP_DEG, -CAL_STEP_DEG, CAL_STEP_DEG / 2, -CAL_STEP_DEG / 2):
+            c = list(c0)
+            c[axis] += step
+            if abs(c[axis]) > RAW_LIMIT_DEG:
+                continue
+            goto(c)
+            m = _measure(cam, base["size"], base["px"])
+            goto(c0)
+            b2 = _measure(cam, base["size"], base["px"])
+            if m is None:
+                continue                       # target left the frame -> try other direction
+            ref = base["e"] if b2 is None else 0.5 * (base["e"] + b2["e"])
+            de = m["e"] - ref
+            col = np.array([-de[0], de[1]]) / step   # physical deg per raw deg
+            break
+        if col is None:
+            print(f"[calib] {name}: target lost during the test move - calibration failed")
+            goto(c0)
+            return None
+        if np.hypot(*col) < CAL_MIN_RESPONSE:
+            print(f"[calib] {name}: the picture hardly moved ({np.hypot(*col):.2f} deg/deg). "
+                  f"Is that servo powered / on the right pin? Calibration failed.")
+            goto(c0)
+            return None
+        d, s = _describe(col)
+        print(f"[calib] {name} +{CAL_STEP_DEG:.0f} deg turns the camera {d}  (x{s:.2f})")
+        cols.append(col)
+
+    P = np.column_stack(cols)
+    # a sideways move shows up cos(forward angle) smaller in the image (same model as the
+    # tracker's err_x / cos(gy)) -> undo that, otherwise steep angles fake a scale error
+    gy_est = float((P @ c0)[1])
+    P[0, :] /= max(0.2, math.cos(math.radians(gy_est)))
+    straight = abs(P[0, 0] * P[1, 1]) >= abs(P[0, 1] * P[1, 0])
+    main = (P[0, 0], P[1, 1]) if straight else (P[0, 1], P[1, 0])
+    cross = (P[0, 1], P[1, 0]) if straight else (P[0, 0], P[1, 1])
+    coupling = max(abs(cross[0]) / abs(main[0]), abs(cross[1]) / abs(main[1]))
+    if coupling < 0.3:                          # clean: snap to swap/invert + per-axis scale
+        def clip(v):   # near 1 -> exactly 1 (measurement noise); otherwise keep the real scale
+            a = abs(v)
+            a = 1.0 if 0.8 <= a <= 1.25 else min(CAL_MAX_SCALE, max(1 / CAL_MAX_SCALE, a))
+            return math.copysign(a, v)
+        P = np.array([[clip(P[0, 0]), 0.0], [0.0, clip(P[1, 1])]]) if straight else \
+            np.array([[0.0, clip(P[0, 1])], [clip(P[1, 0]), 0.0]])
+    else:
+        print(f"[calib] note: axes are coupled ({coupling:.0%}) - camera rotated on the gimbal? "
+              f"using the full measured matrix")
+    if abs(np.linalg.det(P)) < 1e-3:
+        print("[calib] both servos move the picture the same way - check the wiring. Failed.")
+        return None
+
+    problems = []
+    if not straight:
+        problems.append("X and Y servos are SWAPPED")
+    xs, ys = (P[0, 0], P[1, 1]) if straight else (P[1, 0], P[0, 1])   # sign of X / Y servo
+    if xs < 0:
+        problems.append("X servo direction is INVERTED")
+    if ys < 0:
+        problems.append("Y servo direction is INVERTED")
+    print("[calib] result: " + ("; ".join(problems) if problems else "wired as expected")
+          + " -> compensated automatically")
+    print(f"[calib] P = {np.round(P, 3).tolist()}")
+    gimbal.set_mapping(P)
+    gimbal.set_raw(*c0)
+    time.sleep(CAL_SETTLE_S)
+    gimbal.reset_history()
+    return P
+
+
 # --------------------------- main loop ---------------------------
 def tune_mode(cam):
     global R_MIN, RG_MIN, RG_FRAC, BG_TOL
@@ -745,10 +983,31 @@ def run(args):
     global DRONE_ALT_M
     if args.bench:
         DRONE_ALT_M = args.bench            # camera-to-target distance on the desk
-    frozen = args.no_servo or bool(args.bench)
-    gimbal = Gimbal(hardware=not args.sim, frozen=args.no_servo, hold_zero=bool(args.bench))
+    frozen = args.no_servo
+
+    # servo -> image mapping: manual flags > saved calibration > as designed
+    mapping, need_cal = None, False
+    if args.swap_axes or args.invert_x or args.invert_y:
+        sx, sy = (-1.0 if args.invert_x else 1.0), (-1.0 if args.invert_y else 1.0)
+        mapping = np.array([[0.0, sy], [sx, 0.0]]) if args.swap_axes else np.diag([sx, sy])
+        print(f"[calib] manual mapping from command line: P = {mapping.tolist()}")
+    elif not frozen:
+        if not args.calibrate and not args.sim:
+            mapping = load_calibration()
+            if mapping is not None:
+                print(f"[calib] loaded {CALIB_FILE}: P = {np.round(mapping, 3).tolist()}")
+        need_cal = args.calibrate or (mapping is None and not args.no_autocal)
+        if need_cal:
+            print("[calib] servo calibration will run when the target is first seen")
+    cal_attempts = 0
+
+    gimbal = Gimbal(hardware=not args.sim, frozen=frozen, mapping=mapping)
     if args.sim:
-        cam = SimCamera(gimbal, tuple(args.sim), tilt=args.tilt, pink=args.pink, glare=args.glare)
+        sx, sy = (-1.0 if args.sim_invert_x else 1.0), (-1.0 if args.sim_invert_y else 1.0)
+        k = args.sim_servo_scale
+        hw = np.array([[0.0, sy * k], [sx * k, 0.0]]) if args.sim_swap else np.diag([sx * k, sy * k])
+        cam = SimCamera(gimbal, tuple(args.sim), tilt=args.tilt, pink=args.pink, glare=args.glare,
+                        hw_mapping=hw)
     else:
         cam = Camera()
     if args.tune:
@@ -773,7 +1032,24 @@ def run(args):
     result = None
     last_logged_circle_count, last_logged_angle, last_event_log_time = None, None, 0.0
     geometry, geometry_frame_counter = None, 0
-    t_debug = -math.inf
+    last_abs, prev_err, grow_count, limit_count = None, None, 0, 0
+    acq = None                              # (raw servo cmd, pixel pos, size) when first seen
+
+    def run_calibration(det, why, go_back=False):
+        nonlocal need_cal, cal_attempts, tgt_abs, last_abs, prev_err, grow_count, limit_count
+        cal_attempts += 1
+        print(f"[calib] {why} (attempt {cal_attempts})")
+        pos, size = (det["x"], det["y"]), det["w"]
+        if go_back and acq is not None:     # runaway: target is near the edge -> go back first
+            gimbal.set_raw(*acq[0])
+            time.sleep(CAL_SETTLE_S)
+            pos, size = acq[1], acq[2]
+        P = calibrate_gimbal(cam, gimbal, size, pos)
+        if P is not None and not args.sim:
+            save_calibration(P)
+        need_cal = P is None and cal_attempts < 3     # failed -> try again at next detection
+        tgt_abs, last_abs, prev_err, grow_count, limit_count = None, None, None, 0, 0
+        return P is not None
 
     try:
         while True:
@@ -786,16 +1062,20 @@ def run(args):
             H, W = frame.shape[:2]
             gx, gy = (gimbal.x, gimbal.y) if frozen else gimbal.angle_at(t_cap)
             exp_px = expected_diameter_px(gx, gy, st["alt"])
-            diagnostics = {} if getattr(args, "debug", False) and now - t_debug >= 0.5 else None
             det, line = None, ""
 
             if state == "SEARCH":
                 if now >= settle_until:
-                    det, _ = detect(frame, exp_px, size_range=SEARCH_SIZE_RATIO, diagnostics=diagnostics)
+                    det, _ = detect(frame, exp_px, size_range=SEARCH_SIZE_RATIO)
                     if det:
                         state, misses, centred, off_count = "TRACK", 0, 0, 0
                         last_size, tgt_abs = det["w"], None
                         print(f"[search] target found at aim point {gi} ({gimbal.x:+.1f}, {gimbal.y:+.1f}) deg")
+                        acq = ((gimbal.cx, gimbal.cy), (det["x"], det["y"]), det["w"])
+                        if need_cal and cal_attempts < 3:
+                            run_calibration(det, "first detection -> calibrating servos")
+                            last_pos = (det["x"], det["y"])
+                            continue                   # this frame is stale now
                     elif len(grid) > 1:
                         gi = (gi + 1) % len(grid)
                         gimbal.move_to(*grid[gi])
@@ -804,12 +1084,18 @@ def run(args):
             else:
                 half = int(max(ROI_HALF_MIN, 2.5 * last_size, 3 * exp_px))
                 px, py = last_pos
+                if last_abs is not None and not frozen:
+                    # where the target should appear now that the gimbal has moved
+                    ppx, ppy = angles_to_pixel(last_abs[0] - gx, last_abs[1] - gy, gy, W, H)
+                    if 0 <= ppx < W and 0 <= ppy < H:
+                        px, py = ppx, ppy
+                        last_pos = (px, py)
                 roi = (int(max(0, px - half)), int(max(0, py - half)),
                        int(min(W, px + half)), int(min(H, py + half)))
                 det, _ = detect(frame, last_size, roi=roi, prefer=last_pos,
-                                size_range=TRACK_SIZE_RATIO, shape_fallback=True, diagnostics=diagnostics)
+                                size_range=TRACK_SIZE_RATIO, shape_fallback=True)
                 if det is None and misses >= 2:
-                    det, _ = detect(frame, last_size, prefer=last_pos, size_range=TRACK_SIZE_RATIO, diagnostics=diagnostics)
+                    det, _ = detect(frame, last_size, prefer=last_pos, size_range=TRACK_SIZE_RATIO)
                 if det is None:
                     misses += 1
                     if misses > COAST_FRAMES:
@@ -817,7 +1103,15 @@ def run(args):
                         if state == "LOCKED":
                             state = "TRACK"
                     if misses > LOST_FRAMES:
+                        if grow_count >= 2 and not frozen:
+                            # the gimbal was driving the target OUT of the picture
+                            print("[track] target was lost while the error was growing - "
+                                  "servo mapping looks wrong")
+                            if not args.no_autocal and cal_attempts < 3:
+                                need_cal = True
                         state, estimates, tgt_abs = "SEARCH", deque(maxlen=60), None
+                        last_abs, prev_err, grow_count, limit_count = None, None, 0, 0
+                        gimbal.move_to(*grid[gi])      # go back to the search aim point
                         settle_until = now + SETTLE_S
                         print("[track] target lost -> SEARCH")
                     line = f"{state} (target missing {misses})"
@@ -835,6 +1129,7 @@ def run(args):
                 # absolute direction of the target = where the gimbal pointed when the frame
                 # was taken + the error seen in that frame  (latency compensation)
                 ax_abs, ay_abs = gx + err_x, gy + err_y
+                last_abs = (ax_abs, ay_abs)
                 if tgt_abs is None:
                     tgt_abs = (ax_abs, ay_abs)
                 else:
@@ -871,6 +1166,30 @@ def run(args):
                     sy = K_TRACK * (tgt_abs[1] - gimbal.y)
                     sx = 0.0 if abs(sx) < DEADBAND_DEG else max(-MAX_STEP_DEG, min(MAX_STEP_DEG, sx))
                     sy = 0.0 if abs(sy) < DEADBAND_DEG else max(-MAX_STEP_DEG, min(MAX_STEP_DEG, sy))
+                    # runaway guard: error keeps growing, or we push into a limit
+                    err_n = math.hypot(err_x, err_y)
+                    moving = abs(sx) > 0 or abs(sy) > 0
+                    grow_count = grow_count + 1 if (moving and prev_err is not None
+                                                    and err_n > prev_err + 0.05) else 0
+                    pushing = (abs(err_x) > 2 * lock_thr and gimbal.at_limit(0, err_x)) or \
+                              (abs(err_y) > 2 * lock_thr and gimbal.at_limit(1, err_y))
+                    limit_count = limit_count + 1 if pushing else 0
+                    prev_err = err_n
+                    if grow_count >= RUNAWAY_GROW_FRAMES or limit_count >= RUNAWAY_LIMIT_FRAMES:
+                        why = "error kept growing" if grow_count >= RUNAWAY_GROW_FRAMES else \
+                              "gimbal stuck on its limit"
+                        print(f"[track] RUNAWAY detected ({why}) - servo mapping looks wrong")
+                        if not args.no_autocal and cal_attempts < 3:
+                            run_calibration(det, "re-calibrating", go_back=True)
+                        else:
+                            print("[track] going back. Try --calibrate, or --invert-x / --swap-axes")
+                            if acq is not None:
+                                gimbal.set_raw(*acq[0])
+                            else:
+                                gimbal.move_to(*grid[gi])
+                            tgt_abs, last_abs, prev_err, grow_count, limit_count = None, None, None, 0, 0
+                        last_pos = (det["x"], det["y"])
+                        continue
                     if sx or sy:
                         gimbal.move_by(sx, sy)
 
@@ -909,21 +1228,6 @@ def run(args):
                         last_logged_angle = object_angle
                     last_event_log_time = now
 
-            if diagnostics is not None:
-                def metric(name):
-                    value = diagnostics.get(name)
-                    return "N/A" if value is None else f"{value:.2f}"
-                print(f"DEBUG: expected_px={exp_px:.1f} blobs={diagnostics.get('blobs', 0)} "
-                      f"detected_candidates={diagnostics.get('detected_candidates', 0)} "
-                      f"best_size={metric('best_size')} best_shape={metric('best_shape')} "
-                      f"best_colour={metric('best_colour')} "
-                      f"reject_size={diagnostics.get('reject_size', 0)} "
-                      f"reject_shape={diagnostics.get('reject_shape', 0)} "
-                      f"reject_colour={diagnostics.get('reject_colour', 0)} "
-                      f"state={state} phase={'detect' if 'blobs' in diagnostics else 'settling'} "
-                      f"frame={W}x{H} BGR")
-                t_debug = now
-
             dt, t_prev = now - t_prev, now
             if dt > 0:
                 fps = 0.9 * fps + 0.1 / dt
@@ -939,20 +1243,38 @@ def run(args):
                 cv2.drawMarker(view, (vW // 2, vH // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
                 if det is not None:
                     c = (int(round(det["x"] * ds)), int(round(det["y"] * ds)))
+                    axes = (max(3, int(det["w"] * ds / 2)),
+                            max(2, int(det["h"] * ds / 2)))
+
+                    # Restore the old behaviour: the actually detected circular/
+                    # elliptical target is visibly filled red in the preview.
+                    cv2.ellipse(view, c, axes, det["angle"], 0, 360,
+                                (0, 0, 255), -1)
+                    cv2.ellipse(view, c, axes, det["angle"], 0, 360,
+                                (255, 255, 255), 2)
                     cv2.line(view, (vW // 2, vH // 2), c, colour, 1)
                 if geometry is not None:
                     q = np.rint(geometry["contour"].astype(np.float32) * ds).astype(np.int32)
                     cv2.drawContours(view, [q], -1, (255, 0, 255), 1)
                 cv2.putText(view, state, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
-                if geometry is not None:
-                    tilt_text = f"{geometry['angle']:+.1f}" if geometry["angle"] is not None else "N/A"
-                    cv2.putText(view, f"Viditelne kruhy: {len(geometry['circles'])}  Naklon: {tilt_text}",
-                                (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # A tracked round target counts as visible even when there is
+                # no surrounding quadrilateral in the current bench test.
+                shown_circle_count = len(geometry["circles"]) if geometry is not None else 0
+                if det is not None:
+                    shown_circle_count = max(1, shown_circle_count)
+                tilt_text = (
+                    f"{geometry['angle']:+.1f}"
+                    if geometry is not None and geometry["angle"] is not None
+                    else "N/A"
+                )
+                cv2.putText(view,
+                            f"Viditelne kruhy: {shown_circle_count}  Naklon: {tilt_text}",
+                            (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (255, 255, 255), 1)
                 if det is not None:
                     cv2.putText(view, f"disc tilt {det['tilt']:.0f} deg [{det['source']}]", (10, 74),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 cv2.putText(view, f"FPS: {fps:.1f}", (10, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                fill_confirmed_target(view, det, ds)
                 cv2.imshow("tracker (q = quit)", view)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -972,10 +1294,9 @@ def run(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--show", action="store_true", help="preview window")
-    ap.add_argument("--debug", action="store_true", help="detection diagnostics at most twice per second")
     ap.add_argument("--no-servo", action="store_true", help="don't move the gimbal (detection test)")
     ap.add_argument("--bench", type=float, default=0, metavar="DIST_M",
-                    help="desk test: camera-to-target distance in metres, servos held at 0/0")
+                    help="desk test: camera-to-target distance in metres, no search sweep")
     ap.add_argument("--geometry", action="store_true", help="print quad/circle (Naklon) info without --show")
     ap.add_argument("--tune", action="store_true", help="colour threshold sliders")
     ap.add_argument("--sim", nargs=2, type=float, metavar=("X", "Y"), help="simulate, target at field X, Y")
@@ -983,4 +1304,16 @@ if __name__ == "__main__":
     ap.add_argument("--pink", action="store_true", help="sim: NoIR pink rendering of the red ink")
     ap.add_argument("--glare", action="store_true", help="sim: glare spot on the disc")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N seconds")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="re-measure the servo->image mapping when the target is first seen")
+    ap.add_argument("--no-autocal", action="store_true",
+                    help="never calibrate automatically (use saved file / manual flags only)")
+    ap.add_argument("--swap-axes", action="store_true", help="manual: X and Y servos swapped")
+    ap.add_argument("--invert-x", action="store_true", help="manual: servo on X_PIN turns the wrong way")
+    ap.add_argument("--invert-y", action="store_true", help="manual: servo on Y_PIN turns the wrong way")
+    ap.add_argument("--sim-swap", action="store_true", help="sim: pretend the servos are swapped")
+    ap.add_argument("--sim-invert-x", action="store_true", help="sim: pretend the X servo is reversed")
+    ap.add_argument("--sim-invert-y", action="store_true", help="sim: pretend the Y servo is reversed")
+    ap.add_argument("--sim-servo-scale", type=float, default=1.0,
+                    help="sim: real servo degrees per commanded degree")
     run(ap.parse_args())
