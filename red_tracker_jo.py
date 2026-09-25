@@ -88,7 +88,7 @@ DRONE_ALT_M = 20.0
 DRONE_YAW_DEG = 90.0
 
 # --- gimbal servos (pigpio, BCM pins) ---
-X_PIN, Y_PIN = 21, 20
+X_PIN, Y_PIN = 20, 21
 X_CENTER_US, Y_CENTER_US = 1500, 1500
 US_PER_DEG = 1000.0 / 90.0
 X_DIR, Y_DIR = 1, 1
