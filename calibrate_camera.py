@@ -32,6 +32,8 @@ def main() -> int:
     parser.add_argument('--count', type=int, default=25, help='Počet snímků z kamery (výchozí 25).')
     parser.add_argument('--save-dir', type=Path, help='Uloží použité snímky pro pozdější --images.')
     parser.add_argument('--output', type=Path, default=Path('camera_calibration.json'))
+    parser.add_argument('--width', type=int, default=1296, help='Musí odpovídat rozlišení letu (--jako-red-tracker: 1296).')
+    parser.add_argument('--height', type=int, default=972, help='Musí odpovídat rozlišení letu (--jako-red-tracker: 972).')
     args = parser.parse_args()
     try:
         pattern = tuple(int(value) for value in args.pattern.lower().split('x'))
@@ -76,7 +78,8 @@ def capture(args, pattern):
     show = not sys.platform.startswith('linux') or bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
     frames, last_time, last_center = [], 0.0, None
     with ExitStack() as stack:
-        device = PiCamera(args.picamera) if args.picamera is not None else Camera(args.camera)
+        device = (PiCamera(args.picamera, width=args.width, height=args.height, tuning_file='ov5647_noir.json')
+                  if args.picamera is not None else Camera(args.camera))
         camera = stack.enter_context(device)
         if show:
             stack.callback(cv2.destroyAllWindows)

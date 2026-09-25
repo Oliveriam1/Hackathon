@@ -13,6 +13,41 @@ X_LIMITS = (-60.0, 60.0)
 Y_LIMITS = (-45.0, 45.0)
 
 
+class ServoCalibration:
+    """Skutečný úhel kamery = scale * příkaz + offset (každá osa zvlášť).
+
+    MG996R nemá přesně 90° na 1000 µs a jeho nula nebývá přesně kolmo dolů.
+    Změří se nástrojem tools/calibrate_servos.py. Bez kalibrace scale 1, offset 0.
+    """
+
+    def __init__(self, right_scale=1.0, right_offset=0.0, forward_scale=1.0, forward_offset=0.0):
+        if not right_scale or not forward_scale:
+            raise ValueError('Měřítko serva nesmí být 0.')
+        self.right_scale, self.right_offset = right_scale, right_offset
+        self.forward_scale, self.forward_offset = forward_scale, forward_offset
+
+    def __eq__(self, other):
+        return isinstance(other, ServoCalibration) and vars(self) == vars(other)
+
+    @classmethod
+    def load(cls, path):
+        import json
+        with open(path, encoding='utf-8') as file:
+            data = json.load(file)
+        return cls(float(data['right']['scale']), float(data['right']['offset']),
+                   float(data['forward']['scale']), float(data['forward']['offset']))
+
+    def save(self, path):
+        import json
+        with open(path, 'w', encoding='utf-8') as file:
+            json.dump({'right': {'scale': self.right_scale, 'offset': self.right_offset},
+                       'forward': {'scale': self.forward_scale, 'offset': self.forward_offset}}, file, indent=2)
+
+    def command(self, right, forward):
+        """Požadovaný skutečný úhel -> příkaz serva (stupně)."""
+        return (right-self.right_offset)/self.right_scale, (forward-self.forward_offset)/self.forward_scale
+
+
 class _Lgpio:
     """Náhrada pigpio přes lgpio (výchozí v Raspberry Pi OS Bookworm, i Pi 5)."""
 
@@ -62,11 +97,16 @@ def _connect():
 
 
 class Gimbal:
-    """Úhly x, y jsou fyzické (stupně). Při otevření najede do 0/0."""
+    """Úhly x, y jsou skutečné úhly kamery (stupně). Při otevření najede do 0/0.
 
-    def __init__(self, pi=None):
+    x_dir / y_dir = -1 otočí směr osy, calibration převádí skutečný úhel na příkaz.
+    """
+
+    def __init__(self, pi=None, *, x_dir=X_DIR, y_dir=Y_DIR, calibration=None):
         self.x = self.y = 0.0
         self.pi = pi
+        self.x_dir, self.y_dir = x_dir, y_dir
+        self.calibration = calibration or ServoCalibration()
 
     def open(self):
         if self.pi is None:
@@ -74,8 +114,9 @@ class Gimbal:
         self.move_to(0.0, 0.0)
 
     def pulses(self):
-        px = X_CENTER_US + X_DIR * self.x * US_PER_DEG
-        py = Y_CENTER_US + Y_DIR * self.y * US_PER_DEG
+        cx, cy = self.calibration.command(self.x, self.y)
+        px = X_CENTER_US + self.x_dir * cx * US_PER_DEG
+        py = Y_CENTER_US + self.y_dir * cy * US_PER_DEG
         return int(max(500, min(2500, px))), int(max(500, min(2500, py)))
 
     def move_to(self, x, y):
@@ -100,7 +141,11 @@ class Gimbal:
                 pi.stop()
 
     def __enter__(self):
-        self.open()
+        try:
+            self.open()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, *args):
