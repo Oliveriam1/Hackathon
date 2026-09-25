@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Red-target gimbal tracker for a drone-mounted, downward-looking camera (Raspberry Pi 3)
-=====================================================================================
+=========a============================================================================
 Scenario: 60 x 30 m concrete field, 200 mm red disc lying somewhere on it, drone hovering
 at ~20 m with RTK/GNSS position. A 2-axis servo gimbal points the camera.
 
