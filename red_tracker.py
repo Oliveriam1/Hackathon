@@ -62,9 +62,9 @@ PINK_R_MIN = 80
 PINK_RG_MIN = 22
 PINK_BG_MIN = 8
 PINK_MIN_CHROMA = 30
-PINK_MAX_ASPECT = 1.65
-PINK_MIN_FILL = 0.32
-PINK_MIN_CIRCULARITY = 0.45
+PINK_MAX_ASPECT = 4.5
+PINK_MIN_FILL = 0.20
+PINK_MIN_CIRCULARITY = 0.20
 MIN_AREA_PX = 3         # at 20 m the disc is only a few px, keep this small
 SIZE_RATIO = (0.4, 2.5) # expected-size gate kept for ordinary red blobs
 MIN_FILL = 0.3          # blob area / bounding-box area (only checked for blobs >= 8 px)
@@ -492,13 +492,32 @@ def _red_and_pink_circle_masks(img):
         if pixel_area < MIN_AREA_PX:
             continue
 
-        aspect = max(w, h) / float(max(1, min(w, h)))
-        fill = pixel_area / float(w * h)
-        if aspect > PINK_MAX_ASPECT or fill < PINK_MIN_FILL:
+        # A real circle viewed under perspective becomes an ellipse. Use the
+        # rotated bounding rectangle, not the axis-aligned box, so strongly
+        # tilted circles are not rejected just because they look flattened.
+        rect = cv2.minAreaRect(contour)
+        rw, rh = rect[1]
+        if rw <= 0.0 or rh <= 0.0:
             continue
 
-        if max(w, h) >= 8:
-            area = abs(cv2.contourArea(contour))
+        aspect = max(rw, rh) / max(1.0, min(rw, rh))
+        if aspect > PINK_MAX_ASPECT:
+            continue
+
+        area = abs(cv2.contourArea(contour))
+        rect_area = rw * rh
+        if rect_area <= 0.0:
+            continue
+
+        # For an ellipse, area / rotated-rectangle area is close to pi/4
+        # regardless of perspective angle. Rectangles tend toward 1.0.
+        rotated_fill = area / rect_area
+        if not (0.48 <= rotated_fill <= 0.92):
+            continue
+
+        # Keep a very light circularity floor only to discard broken/noisy
+        # fragments. Perspective ellipses are intentionally allowed.
+        if max(rw, rh) >= 8:
             perimeter = cv2.arcLength(contour, True)
             if perimeter <= 0.0:
                 continue
