@@ -66,8 +66,25 @@ PINK_MAX_ASPECT = 4.5
 PINK_MIN_FILL = 0.20
 PINK_MIN_CIRCULARITY = 0.20
 MIN_AREA_PX = 3         # at 20 m the disc is only a few px, keep this small
-SIZE_RATIO = (0.4, 2.5) # expected-size gate kept for ordinary red blobs
-MIN_FILL = 0.3          # blob area / bounding-box area (only checked for blobs >= 8 px)
+# Physical target is 200 mm, but its pixel diameter is computed dynamically
+# from camera FOV + current slant range. These are ratios to that expected
+# pixel diameter, never absolute pixel sizes.
+TARGET_SIZE_RATIO = (0.35, 2.20)
+# A circle seen obliquely becomes an ellipse. The major/minor ratio is allowed
+# to be large enough for strong perspective while still rejecting line-like glare.
+TARGET_MAX_PERSPECTIVE_ASPECT = 5.0
+TARGET_MIN_ROTATED_FILL = 0.42
+TARGET_MAX_ROTATED_FILL = 0.94
+
+# Reflection rejection. A genuine painted disc should contain a substantial
+# amount of red/pink colour across its silhouette. Specular reflections often
+# have a white/neutral core or only a thin coloured rim.
+TARGET_MIN_COLOUR_COVERAGE = 0.52
+TARGET_MAX_NEUTRAL_HIGHLIGHT = 0.32
+HIGHLIGHT_MIN = 240
+HIGHLIGHT_MAX_CHROMA = 24
+
+MIN_FILL = 0.3          # cheap first-pass blob fill check
 
 # --- field & drone (field coordinates in metres, origin at one corner) ---
 FIELD_W, FIELD_H = 60.0, 30.0
@@ -580,6 +597,84 @@ def _red_and_pink_circle_masks(img):
     return target_mask, red_strength, pink_circle_mask
 
 
+
+def _candidate_geometry_and_reflection_metrics(img, labels, label_id, bx, by, bw, bh):
+    """Cheap per-candidate validation on a small ROI.
+
+    Returns (major_px, aspect, rotated_fill, colour_coverage, neutral_highlight)
+    or None when no usable contour exists.
+    """
+    label_roi = labels[by:by + bh, bx:bx + bw]
+    component = (label_roi == label_id)
+    if not np.any(component):
+        return None
+
+    component_u8 = component.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        component_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(contour)
+    rw, rh = rect[1]
+    if rw <= 0.0 or rh <= 0.0:
+        # Tiny 1-2 px candidates cannot provide a stable rotated rectangle.
+        major = float(max(bw, bh))
+        return major, 1.0, 0.78, 1.0, 0.0
+
+    major = float(max(rw, rh))
+    minor = float(min(rw, rh))
+    aspect = major / max(1.0, minor)
+    contour_area = abs(cv2.contourArea(contour))
+    rect_area = rw * rh
+    rotated_fill = contour_area / rect_area if rect_area > 0.0 else 0.0
+
+    # Build the outer candidate silhouette. This intentionally fills any hole
+    # so a white specular core is counted as a reflection, not ignored.
+    silhouette = np.zeros((bh, bw), dtype=np.uint8)
+    cv2.drawContours(silhouette, [contour], -1, 255, cv2.FILLED)
+    inside = silhouette != 0
+    inside_count = int(np.count_nonzero(inside))
+    if inside_count == 0:
+        return None
+
+    patch = img[by:by + bh, bx:bx + bw]
+    b = patch[:, :, 0].astype(np.int16, copy=False)
+    g = patch[:, :, 1].astype(np.int16, copy=False)
+    r = patch[:, :, 2].astype(np.int16, copy=False)
+
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    chroma = maxc - minc
+
+    # Match the existing red/pink logic, but only inside this tiny candidate.
+    redness = r - np.maximum(g, b)
+    red_like = (
+        (redness > REDNESS_MIN)
+        & (r > R_MIN)
+        & (redness > (r * RED_FRACTION_MIN))
+    )
+    pink_like = (
+        (r > PINK_R_MIN)
+        & ((r - g) > PINK_RG_MIN)
+        & ((b - g) > PINK_BG_MIN)
+        & (chroma > PINK_MIN_CHROMA)
+    )
+    coloured = (red_like | pink_like) & inside
+    colour_coverage = float(np.count_nonzero(coloured)) / inside_count
+
+    neutral_highlight = (
+        (maxc >= HIGHLIGHT_MIN)
+        & (chroma <= HIGHLIGHT_MAX_CHROMA)
+        & inside
+    )
+    highlight_fraction = float(np.count_nonzero(neutral_highlight)) / inside_count
+
+    return major, aspect, rotated_fill, colour_coverage, highlight_fraction
+
+
 def detect(frame, exp_px, roi=None, prefer=None):
     """Find the best red/pink circular target.
 
@@ -617,18 +712,36 @@ def detect(frame, exp_px, roi=None, prefer=None):
         if area < MIN_AREA_PX:
             continue
 
-        major = max(bw, bh)
+        # The 200 mm target size is converted to exp_work for the current
+        # distance/slant angle. Validate every colour branch against that dynamic
+        # size instead of letting pink objects bypass the size check.
+        metrics = _candidate_geometry_and_reflection_metrics(
+            img, labels, i, bx, by, bw, bh
+        )
+        if metrics is None:
+            continue
+        major, aspect, rotated_fill, colour_coverage, highlight_fraction = metrics
         ratio = major / exp_work
 
-        component_labels = (labels[by:by + bh, bx:bx + bw] == i)
-        pink_here = pink_circle_mask[by:by + bh, bx:bx + bw]
-        is_pink_circle = bool(np.any(component_labels & (pink_here != 0)))
-        if not is_pink_circle and not (SIZE_RATIO[0] <= ratio <= SIZE_RATIO[1]):
+        if not (TARGET_SIZE_RATIO[0] <= ratio <= TARGET_SIZE_RATIO[1]):
             continue
-        if major >= 8 and area / float(bw * bh) < MIN_FILL:
+        if aspect > TARGET_MAX_PERSPECTIVE_ASPECT:
+            continue
+        if major >= 8:
+            if not (TARGET_MIN_ROTATED_FILL <= rotated_fill <= TARGET_MAX_ROTATED_FILL):
+                continue
+            if colour_coverage < TARGET_MIN_COLOUR_COVERAGE:
+                continue
+            if highlight_fraction > TARGET_MAX_NEUTRAL_HIGHLIGHT:
+                continue
+        if max(bw, bh) >= 8 and area / float(bw * bh) < MIN_FILL:
             continue
 
+        # Prefer candidates closest to the physically expected apparent size.
+        # Reflection penalties break ties without adding temporal state.
         cost = abs(math.log(max(ratio, 1e-6)))
+        cost += max(0.0, TARGET_MIN_COLOUR_COVERAGE - colour_coverage) * 2.0
+        cost += highlight_fraction * 1.5
         if prefer_work is not None:
             cxw, cyw = bx + bw / 2, by + bh / 2
             denom = max(ROI_HALF_MIN * scale, 4 * exp_work, 1.0)
