@@ -156,3 +156,13 @@ Rozdělení komponent a rozhraní dalších fází popisuje [ARCHITECTURE.md](AR
 `main.py` nyní pouze načte konfiguraci a spustí aplikaci; stejné příkazy fungují dál.
 Následné změny detekce popisuje DETECTION.md; nastavení kamery zůstává zachované. Letová mise a automatické
 sledování servy zatím implementované nejsou.
+
+## Sledování tečky kamerou
+
+Regulátor je implementovaný. Pro neověřené zapojení použijte výpočet bez pohybu:
+
+```bash
+python3 main.py --picamera 0 --width 1296 --height 972 --track-camera --gimbal-dry-run --status
+```
+
+Detaily zapojení, geometrických předpokladů a aktivace jsou v [DETECTION.md](DETECTION.md).

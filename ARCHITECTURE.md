@@ -67,3 +67,10 @@ python main.py --demo --detector geometry --headless
 Testy používají syntetické obrazy a náhrady hardwaru. Pokrývají i oddělení
 JSON od stavových výpisů, statický náhled, konec zdroje a úklid po chybách.
 Neověřují fyzickou kameru, serva ani let.
+
+## Doplnění: regulátor závěsu
+
+`gimbal_controller.py` již obsahuje konkrétní časový regulátor. Pipeline ho
+volá pouze při `--track-camera`; GPIO zápis zůstává v `gimbal.py`. Dry-run
+nevytváří hardwarový závěs. Rozhraní plánovače a letového adaptéru zůstávají
+neimplementovaná. Více viz DETECTION.md.

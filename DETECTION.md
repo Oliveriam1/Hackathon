@@ -126,3 +126,44 @@ Příjemce musí započítat prodlevu přenosu a vlastní čekání; nesmí po v
 zpráv trvale používat poslední platný bod. Bez časové synchronizace nelze z času
 příjmu na jiném počítači zaručit stáří snímku. Čas expozice stále není dostupný.
 Při neplatném měření jsou poloha i obě odchylky null a zbývající platnost je 0.
+
+## Automatické sledování kamerou
+
+Nejdřív výpočet bez přístupu k servům:
+
+```bash
+python3 main.py --picamera 0 --width 1296 --height 972 --track-camera --gimbal-dry-run --status
+```
+
+Dry-run neotevírá GPIO, nevytváří PWM a nenajíždí do nulové polohy. Úhly jsou
+simulované povely; bez fyzického pohybu kamery nelze v tomto režimu očekávat
+zmenšování obrazové chyby. Nepřidávejte `--servo` ani `--jako-red-tracker`.
+
+Po ověření zapojení BCM 18/13, směrů os, neutrálních poloh a mechanických limitů
+lze vynechat `--gimbal-dry-run`. `--track-camera` pak samo zapne serva a nejprve
+najede do 0/0 podle konfigurace. Samostatné `--servo` stále pouze inicializuje závěs.
+
+Regulátor používá geometrickou projekci pixelu, P regulaci v čase, mrtvé pásmo
+0.4° a omezení rychlosti 15°/s na každou osu. `--gimbal-speed 5` umožní pomalejší
+pohyb. `--servo-x-dir -1` a `--servo-y-dir -1` mění znaménko PWM příslušné osy.
+`--image-top forward|right|backward|left` určuje orientaci horní hrany obrazu vůči
+přídi dronu. Výchozí předpoklad je forward. Geometrie očekává vnější osu náklonu
+doprava a vnitřní osu dopředu, nikoli libovolný pan/tilt mechanismus.
+
+Bez kalibrace se použije nominální HFOV a model čtvercových pixelů; přesnější
+model lze načíst přes `--camera-calibration`. Limity ±60° a ±45°, piny, středy
+PWM a převod stupňů na pulzy jsou v src/config.py a musí odpovídat sestavě.
+
+Pohyb se aktualizuje jen z čerstvého potvrzeného měření živé kamery. Při ztrátě,
+predikci, nejednoznačnosti nebo opakovaném/starém snímku se další korekce
+nevydá; serva drží poslední požadovanou polohu. Na mechanickém limitu se nesnaží
+posílat úhly za limit. Při ukončení se PWM vypne dosavadním zavíráním Gimbal.
+Program nijak neřídí samotný dron.
+
+JSON i `--drone-data` obsahují položku `gimbal`: stav, dry_run, command_sent a
+commanded_angles_deg. Jde výhradně o odhad ze zaslaných povelů, ne změřenou
+polohu závěsu (`angle_basis=command_estimate_no_feedback`).
+
+Ověřeno jednotkovými testy a simulací s ideálními servy: směry, rychlost,
+limity, centrování ve čtyřech orientacích, výpadky, stale data a absence zápisu
+v dry-run. Zapojení ani chování reálného mechanismu zatím ověřené nejsou.

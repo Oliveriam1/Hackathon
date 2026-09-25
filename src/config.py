@@ -71,6 +71,12 @@ class AppConfig:
     baud: int = 115200
     target_system: int | None = None
     ev: float | None = None
+    track_camera: bool = False
+    gimbal_dry_run: bool = False
+    servo_x_dir: int = 1
+    servo_y_dir: int = 1
+    gimbal_speed: float = 15.0
+    image_top: str = 'forward'
     servo: bool = False
     jako_red_tracker: bool = False
 
@@ -118,6 +124,12 @@ def parse_args(argv=None) -> AppConfig:
     parser.add_argument('--target-system', type=int, help='Očekávané MAVLink system ID autopilota.')
     parser.add_argument('--ev', type=float, default=None,
                         help='Kompenzace expozice CSI kamery, např. --ev -2. Jinak výchozí nastavení profilu.')
+    parser.add_argument('--track-camera', action='store_true', help='Automaticky centrovat kameru servy na potvrzený cíl.')
+    parser.add_argument('--gimbal-dry-run', action='store_true', help='S --track-camera počítat úhly bez GPIO.')
+    parser.add_argument('--servo-x-dir', type=int, choices=(-1, 1), default=1)
+    parser.add_argument('--servo-y-dir', type=int, choices=(-1, 1), default=1)
+    parser.add_argument('--gimbal-speed', type=float, default=15., help='Maximální rychlost každé osy ve stupních/s.')
+    parser.add_argument('--image-top', choices=('forward', 'right', 'backward', 'left'), default='forward')
     parser.add_argument('--servo', action='store_true',
                         help='Serva závěsu přes pigpio (BCM 18 a 13) jako red_tracker.py; najedou do 0/0.')
     parser.add_argument('--jako-red-tracker', action='store_true',
@@ -132,6 +144,14 @@ def parse_args(argv=None) -> AppConfig:
         args.width, args.height = 1296, 972  # plné zorné pole OV5647, binning 2x2
         args.tuning_file = args.tuning_file or 'ov5647_noir.json'
         args.servo = True
+    if args.gimbal_dry_run and (not args.track_camera or args.servo):
+        parser.error('--gimbal-dry-run vyžaduje --track-camera a nesmí zapnout --servo ani preset serv.')
+    if args.track_camera:
+        if args.image or args.video or args.demo or args.snapshot:
+            parser.error('--track-camera vyžaduje živou kameru, i pro dry-run.')
+        args.servo = not args.gimbal_dry_run
+    if not np.isfinite(args.gimbal_speed) or not 0 < args.gimbal_speed <= 60:
+        parser.error('--gimbal-speed musí být v rozsahu (0, 60] stupňů/s.')
     if args.red_diameter_px is not None and (not np.isfinite(args.red_diameter_px) or args.red_diameter_px <= 0 or args.detector != 'red'):
         parser.error('--red-diameter-px musí být kladné číslo a vyžaduje --detector red.')
     if args.tuning_file is not None and args.picamera is None:

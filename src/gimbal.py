@@ -60,7 +60,8 @@ def _connect():
 class Gimbal:
     """Úhly x, y jsou fyzické (stupně). Při otevření najede do 0/0."""
 
-    def __init__(self, pi=None):
+    def __init__(self, pi=None, *, x_dir=X_DIR, y_dir=Y_DIR):
+        self.x_dir, self.y_dir = x_dir, y_dir
         self.x = self.y = 0.0
         self.pi = pi
 
@@ -70,8 +71,8 @@ class Gimbal:
         self.move_to(0.0, 0.0)
 
     def pulses(self):
-        px = X_CENTER_US + X_DIR * self.x * US_PER_DEG
-        py = Y_CENTER_US + Y_DIR * self.y * US_PER_DEG
+        px = X_CENTER_US + self.x_dir * self.x * US_PER_DEG
+        py = Y_CENTER_US + self.y_dir * self.y * US_PER_DEG
         return int(max(500, min(2500, px))), int(max(500, min(2500, py)))
 
     def move_to(self, x, y):
@@ -96,7 +97,11 @@ class Gimbal:
                 pi.stop()
 
     def __enter__(self):
-        self.open()
+        try:
+            self.open()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, *args):

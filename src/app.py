@@ -27,9 +27,9 @@ def run(args: AppConfig) -> int:
                 # red_tracker.py zapíná serva před kamerou.
                 from src.gimbal import Gimbal
                 try:
-                    gimbal = stack.enter_context(Gimbal())
+                    gimbal = stack.enter_context(Gimbal(x_dir=args.servo_x_dir, y_dir=args.servo_y_dir))
                 except RuntimeError as error:
-                    if not args.jako_red_tracker:
+                    if not args.jako_red_tracker or args.track_camera:
                         raise
                     print(f'Varování: pokračuji bez serv. {error}', file=sys.stderr)
             camera, frame, source_name = open_source(args, stack)

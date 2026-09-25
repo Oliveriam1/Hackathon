@@ -41,9 +41,16 @@ class Diagnostics:
                 stage += ' odmitnuto=' + (','.join(f'{k}:{v}' for k, v in rejected.items()) or '--')
                 detail = '/'.join(f'{timings.get(k, 0):.0f}' for k in
                                   ('mask', 'components', 'validation', 'geometry', 'tracking'))
+            gimbal = record.get('gimbal', {})
+            servo_text = ''
+            if gimbal.get('enabled'):
+                angles = gimbal['commanded_angles_deg']
+                servo_text = f" | kamera={gimbal['state']} {angles['right']:+.1f}/{angles['forward']:+.1f} deg"
+                if gimbal.get('dry_run'):
+                    servo_text += ' DRY_RUN'
             print(f'FPS={fps} | detekce={observation.processing_ms:.0f} ms | '
                   f'4uhelniky={len(observation.rectangles)} | kandidati={len(observation.circles)} | '
-                  f'{kind} {position} | {lock} | {stage} | faze_ms={detail}', file=self.stream, flush=True)
+                  f'{kind} {position} | {lock} | {stage} | faze_ms={detail}{servo_text}', file=self.stream, flush=True)
             self.last_report, self.count = now, 0
         if self.directory is not None and self.saved < 30 and (self.last_saved is None or now-self.last_saved >= 2):
             prefix = self.directory / f'{self.saved:03d}'
