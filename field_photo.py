@@ -11,6 +11,8 @@ The saved image has no annotations, resizing, detection or colour correction.
 Run: python3 field_photo.py
 On a PC on the same network open http://RASPBERRY_PI_IP:8000/.
 No receiver program is needed on the PC. Photos are also saved locally.
+The web root is ./web_photos by default (--web-root changes it). Timestamped
+photos and latest.png (or latest.jpg) are saved there and available from /.
 Optional --send-url retains HTTP POST upload support. Ctrl+C closes everything.
 """
 
@@ -20,11 +22,13 @@ import argparse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import math
+import os
 from pathlib import Path
+import tempfile
 import threading
 import time
 from typing import Callable
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from src.pi_camera import PiCamera
@@ -87,13 +91,15 @@ update();
 
 
 class PhotoServer:
-    """Serve only the viewer and latest immutable image; slow viewers cannot block capture.
+    """Serve the viewer and photographs directly from the configured web root.
 
-    Local-network viewer, without authentication. No directory listing/file access.
+    Local-network viewer, without authentication. No directory listing or source files.
     The camera publishes a complete image under a short lock after saving it.
     """
-    def __init__(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+    def __init__(self, host: str = "0.0.0.0", port: int = 8000,
+                 root: Path = Path("web_photos")) -> None:
         self.host, self.port = host, port
+        self.root = root.resolve()
         self._lock = threading.Lock()
         self._latest: tuple[bytes, str, str, str] | None = None
         self._version = 0
@@ -101,14 +107,28 @@ class PhotoServer:
         self._thread: threading.Thread | None = None
 
     def publish(self, path: Path) -> None:
+        if path.resolve().parent != self.root:
+            raise ValueError("Fotka musi byt ulozena primo v korenove slozce webu")
         data = path.read_bytes()
         mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        # Atomic replacement prevents a browser from reading a half-written photo.
+        latest_path = self.root / ("latest.png" if mime == "image/png" else "latest.jpg")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.root, prefix=".photo-", delete=False) as handle:
+                temp_path = Path(handle.name)
+                handle.write(data)
+            os.replace(temp_path, latest_path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         with self._lock:
             self._version += 1
             self._latest = data, mime, path.name, f'"{self._version}"'
 
     def __enter__(self) -> PhotoServer:
         owner = self
+        self.root.mkdir(parents=True, exist_ok=True)
 
         class Handler(BaseHTTPRequestHandler):
             def setup(self) -> None:
@@ -136,8 +156,18 @@ class PhotoServer:
                             return
                         headers = {"ETag": etag, "X-Photo-Filename": quote(name, safe="")}
                     else:
-                        self.send_error(404)
-                        return
+                        # Only top-level image files, never arbitrary project paths.
+                        name = unquote(path.lstrip("/"))
+                        image_path = (owner.root / name).resolve()
+                        if (not name or Path(name).name != name or name.startswith(".")
+                                or image_path.parent != owner.root
+                                or image_path.suffix.lower() not in (".png", ".jpg", ".jpeg")
+                                or not image_path.is_file()):
+                            self.send_error(404)
+                            return
+                        data = image_path.read_bytes()
+                        mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+                        headers = {"X-Photo-Filename": quote(name, safe="")}
                     self.send_response(200)
                     self.send_header("Content-Type", mime)
                     self.send_header("Content-Length", str(len(data)))
@@ -159,6 +189,7 @@ class PhotoServer:
                                         kwargs={"poll_interval": 0.1}, daemon=True)
         self._thread.start()
         print(f"Fotky na PC: otevri http://IP_RASPBERRY:{self.port}/ ve stejne siti.", flush=True)
+        print(f"Korenova slozka webu: {self.root}", flush=True)
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -302,8 +333,10 @@ def main() -> int:
     parser.add_argument("--send-url", help="HTTP endpoint prijimajici POST s obrazkem")
     parser.add_argument("--host", default="0.0.0.0", help="Adresa webu; default: vsechna sitova rozhrani")
     parser.add_argument("--port", type=int, default=8000, help="Port pro fotky v prohlizeci (default: 8000)")
+    parser.add_argument("--web-root", type=Path, default=Path("web_photos"),
+                        help="Slozka, do ktere web primo uklada a ze ktere poskytuje fotky")
     parser.add_argument("--output", type=Path, default=Path("pole.png"),
-                        help="Zaklad nazvu fotek; ke kazde se prida cas a poradove cislo")
+                        help="Zaklad nazvu fotek uvnitr --web-root; prida se cas a poradove cislo")
     parser.add_argument("--plan-only", action="store_true", help="Pouze vypocitat vysku, neotevirat kameru")
     args = parser.parse_args()
     try:
@@ -314,8 +347,11 @@ def main() -> int:
         print("Sirka pole musi smerovat podel sirky obrazu. FOV je nutne overit pro konkretni kameru.")
         if args.plan_only:
             return 0
-        with PhotoServer(args.host, args.port) as viewer:
-            photograph_periodically(args.output, interval=args.interval, delay=args.delay,
+        output = (args.web_root / args.output).resolve()
+        if output.parent != args.web_root.resolve():
+            raise ValueError("--output musi lezet primo v --web-root; slozku nastav pomoci --web-root")
+        with PhotoServer(args.host, args.port, args.web_root) as viewer:
+            photograph_periodically(output, interval=args.interval, delay=args.delay,
                                    send_url=args.send_url, count=args.count, on_photo=viewer.publish)
             if args.count:
                 print("Foceni dokonceno. Web zustava dostupny do Ctrl+C.", flush=True)
