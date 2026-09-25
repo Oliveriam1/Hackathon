@@ -74,3 +74,10 @@ Neověřují fyzickou kameru, serva ani let.
 volá pouze při `--track-camera`; GPIO zápis zůstává v `gimbal.py`. Dry-run
 nevytváří hardwarový závěs. Rozhraní plánovače a letového adaptéru zůstávají
 neimplementovaná. Více viz DETECTION.md.
+
+## Doplnění: lokalizace cíle
+
+`target_locator.py` nyní validuje vstupy a volá matematiku `geolocation.py`.
+Pipeline odhad provede před novou korekcí závěsu, připojí jej k plnému JSON
+a přes `drone_data.py` také do `world_position`. Aktivace vyžaduje --locate-target.
+Řízení letu ani automatická mise se tím neaktivují.

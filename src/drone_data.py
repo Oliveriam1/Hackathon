@@ -43,6 +43,7 @@ def drone_record(record, *, session_id=None, max_age_s=0.25):
         'coordinate_frame': 'image_right_down',
         'image_centered': bool(valid and lock['image_centered']),
         'world_position': record['geolocation'] if valid else None,
+        'world_position_status': record.get('geolocation_status', 'UNAVAILABLE'),
         'flight_ready': False,
         'flight_command': None,
         'gimbal': record.get('gimbal', {'enabled': False, 'state': 'DISABLED'}),

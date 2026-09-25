@@ -7,6 +7,7 @@ from .target_lock import TargetLock
 from .publisher import detection_record
 from .mission import Mission
 from .drone_data import drone_record
+from .target_locator import TargetLocator
 
 
 def current_altitude(telemetry, fallback):
@@ -43,6 +44,7 @@ class DetectionPipeline:
         self.config, self.gimbal = config, gimbal
         self.gimbal_controller = None
         self.gimbal_angles = None
+        self.locator = TargetLocator(config)
         if config.track_camera and not config.gimbal_dry_run and gimbal is None:
             raise RuntimeError('Automatické sledování kamery vyžaduje připojená serva.')
 
@@ -88,6 +90,16 @@ class DetectionPipeline:
         record['visual_lock'] = self.target_lock.update(observation, sample_time=sample_time,
                                                       now=time.monotonic())
         record['autonomy'] = self.mission.snapshot()
+        # Úhly platné před novým povelem, nikoli poloha požadovaná až pro další snímek.
+        from .geolocation import GimbalAngles
+        angles, basis = None, 'unknown'
+        if self.gimbal is not None and not self.config.gimbal_dry_run:
+            angles = GimbalAngles(self.gimbal.x, self.gimbal.y)
+            basis = 'command_estimate_no_feedback'
+        elif self.config.camera_right_deg is not None and self.config.camera_forward_deg is not None:
+            angles = GimbalAngles(self.config.camera_right_deg, self.config.camera_forward_deg)
+            basis = 'user_fixed_mount'
+        record['geolocation'], record['geolocation_status'] = self.locator.estimate(record, angles, basis)
         record['gimbal'] = self.follow_camera(observation, sample_time, source)
         record['drone_data'] = drone_record(record, session_id=self.session_id,
                                           max_age_s=self.target_lock.max_age_s)

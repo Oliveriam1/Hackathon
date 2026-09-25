@@ -48,9 +48,16 @@ class Diagnostics:
                 servo_text = f" | kamera={gimbal['state']} {angles['right']:+.1f}/{angles['forward']:+.1f} deg"
                 if gimbal.get('dry_run'):
                     servo_text += ' DRY_RUN'
+            geo_text = ''
+            geo_status = record.get('geolocation_status', 'DISABLED')
+            if geo_status != 'DISABLED':
+                geo_text = f' | poloha={geo_status}'
+                fix = record.get('geolocation')
+                if fix is not None:
+                    geo_text += f" {fix['latitude_deg']:.7f}, {fix['longitude_deg']:.7f}"
             print(f'FPS={fps} | detekce={observation.processing_ms:.0f} ms | '
                   f'4uhelniky={len(observation.rectangles)} | kandidati={len(observation.circles)} | '
-                  f'{kind} {position} | {lock} | {stage} | faze_ms={detail}{servo_text}', file=self.stream, flush=True)
+                  f'{kind} {position} | {lock} | {stage} | faze_ms={detail}{servo_text}{geo_text}', file=self.stream, flush=True)
             self.last_report, self.count = now, 0
         if self.directory is not None and self.saved < 30 and (self.last_saved is None or now-self.last_saved >= 2):
             prefix = self.directory / f'{self.saved:03d}'

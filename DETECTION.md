@@ -167,3 +167,43 @@ polohu závěsu (`angle_basis=command_estimate_no_feedback`).
 Ověřeno jednotkovými testy a simulací s ideálními servy: směry, rychlost,
 limity, centrování ve čtyřech orientacích, výpadky, stale data a absence zápisu
 v dry-run. Zapojení ani chování reálného mechanismu zatím ověřené nejsou.
+
+## Poloha tečky na zemi
+
+`--locate-target` zapojí `target_locator.py` do datového zpracování. Vyžaduje živý
+MAVLink, explicitní rovinu terče `--ground-relative-alt` a známé úhly kamery.
+Pevné uchycení: `--camera-right-deg` a `--camera-forward-deg`. Závěs: úhly jsou
+odhadem z aktuálních povelů skutečného `--servo` / `--track-camera`, před odesláním
+nové korekce. Dry-run se k lokalizaci použít nesmí. Nezadávejte pevné nulové úhly,
+pokud kamera skutečně nemíří kolmo dolů.
+
+Příklad pouze pro ověřenou pevnou kameru kolmo dolů a rovinu cíle ve stejné
+výšce jako home autopilota (port nahraďte skutečným):
+
+```bash
+python3 main.py --picamera 0 --width 1296 --height 972 --drone-data --locate-target --mavlink SKUTECNY_PORT --ground-relative-alt 0 --camera-right-deg 0 --camera-forward-deg 0
+```
+
+Výška nad terčem se počítá jako `relative_alt_m - ground_relative_alt`. Terč na
+vyvýšeném předmětu potřebuje odpovídající výšku své roviny, nikoli výšku okolní půdy.
+`--altitude` pro detekci se v lokalizaci nepoužívá jako náhrada telemetrie.
+Kamera bez kalibrace používá nominální HFOV; `--camera-calibration` dodá změřený model.
+Orientaci horní hrany obrazu určuje `--image-top`.
+
+Výstup v plném JSON je `geolocation`, v kontraktu pro dron `world_position`:
+WGS84 latitude_deg/longitude_deg, offset_north_m/offset_east_m, distance_m,
+bearing_deg, výška nad rovinou terče a horizontal_error_estimate_m.
+Dále obsahuje zdroje modelu, úhlů a předpoklady časování. `--status` vypisuje GPS
+nebo důvod nedostupnosti. Při ztrátě cíle se stará poloha znovu nevydává jako nová.
+
+Výpočet kontroluje stáří heartbeat/pozice/orientace/GPS, 3D GPS fix, přibližný
+časový souběh pozice a orientace se snímkem, kladnou výšku nad rovinou a průsečík
+paprsku s rovinou. Příklady stavů: TELEMETRY_MISSING, TELEMETRY_STALE,
+TELEMETRY_TIME_MISMATCH, GPS_FIX_INVALID, NO_FRESH_TARGET, CAMERA_ANGLES_UNKNOWN,
+POSE_INVALID, CALIBRATION_SIZE_MISMATCH, RAY_OUTSIDE_GROUND_RANGE.
+
+Platný výpočet je označen ESTIMATED. Výchozí model nejistoty není měřená přesnost
+vaší sestavy; nezahrnuje plně časování expozice, vůli a dynamiku serv ani nerovný
+terén. Požadovaný úhel serva není změřená poloha. `flight_ready` zůstává false.
+Ověřeno analytickými příklady i testem integrace před novým povelem servům;
+reálnou přesnost je nutné změřit na známých bodech.

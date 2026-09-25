@@ -71,6 +71,10 @@ class AppConfig:
     baud: int = 115200
     target_system: int | None = None
     ev: float | None = None
+    locate_target: bool = False
+    ground_relative_alt: float | None = None
+    camera_right_deg: float | None = None
+    camera_forward_deg: float | None = None
     track_camera: bool = False
     gimbal_dry_run: bool = False
     servo_x_dir: int = 1
@@ -124,6 +128,10 @@ def parse_args(argv=None) -> AppConfig:
     parser.add_argument('--target-system', type=int, help='Očekávané MAVLink system ID autopilota.')
     parser.add_argument('--ev', type=float, default=None,
                         help='Kompenzace expozice CSI kamery, např. --ev -2. Jinak výchozí nastavení profilu.')
+    parser.add_argument('--locate-target', action='store_true', help='Odhad souřadnic cíle z čerstvé telemetrie.')
+    parser.add_argument('--ground-relative-alt', type=float, help='Výška roviny terče vůči home autopilota v metrech; 0 pouze pro stejnou výšku.')
+    parser.add_argument('--camera-right-deg', type=float, help='Známý pevný náklon kamery doprava, stupně.')
+    parser.add_argument('--camera-forward-deg', type=float, help='Známý pevný náklon kamery dopředu, stupně.')
     parser.add_argument('--track-camera', action='store_true', help='Automaticky centrovat kameru servy na potvrzený cíl.')
     parser.add_argument('--gimbal-dry-run', action='store_true', help='S --track-camera počítat úhly bez GPIO.')
     parser.add_argument('--servo-x-dir', type=int, choices=(-1, 1), default=1)
@@ -150,6 +158,20 @@ def parse_args(argv=None) -> AppConfig:
         if args.image or args.video or args.demo or args.snapshot:
             parser.error('--track-camera vyžaduje živou kameru, i pro dry-run.')
         args.servo = not args.gimbal_dry_run
+    fixed = (args.camera_right_deg, args.camera_forward_deg)
+    if any(v is not None for v in fixed) and not all(v is not None and np.isfinite(v) and abs(v) <= 90 for v in fixed):
+        parser.error('Zadejte oba pevné úhly kamery v rozsahu -90 až 90 stupňů.')
+    if args.ground_relative_alt is not None and not np.isfinite(args.ground_relative_alt):
+        parser.error('--ground-relative-alt musí být konečné číslo.')
+    if args.locate_target:
+        if not args.mavlink or args.ground_relative_alt is None:
+            parser.error('--locate-target vyžaduje --mavlink a explicitní --ground-relative-alt.')
+        if args.gimbal_dry_run:
+            parser.error('Simulované úhly z dry-run nelze použít k lokalizaci.')
+        if args.servo and fixed[0] is not None:
+            parser.error('Zvolte úhly skutečného závěsu, nebo pevné úhly, nikoli obojí.')
+        if not args.servo and fixed[0] is None:
+            parser.error('Lokalizace vyžaduje známé pevné úhly kamery, nebo skutečný závěs --servo.')
     if not np.isfinite(args.gimbal_speed) or not 0 < args.gimbal_speed <= 60:
         parser.error('--gimbal-speed musí být v rozsahu (0, 60] stupňů/s.')
     if args.red_diameter_px is not None and (not np.isfinite(args.red_diameter_px) or args.red_diameter_px <= 0 or args.detector != 'red'):

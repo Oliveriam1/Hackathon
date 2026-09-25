@@ -166,3 +166,9 @@ python3 main.py --picamera 0 --width 1296 --height 972 --track-camera --gimbal-d
 ```
 
 Detaily zapojení, geometrických předpokladů a aktivace jsou v [DETECTION.md](DETECTION.md).
+
+## Lokalizace tečky
+
+Výpočet GPS a posunu cíle na zemi je nyní zapojen přes `--locate-target`.
+Vyžaduje telemetrii, známou rovinu terče a úhly kamery; nejde o letový povel.
+Konfiguraci a omezení odhadu popisuje [DETECTION.md](DETECTION.md#poloha-tečky-na-zemi).
