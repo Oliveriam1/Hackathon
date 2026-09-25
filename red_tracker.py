@@ -712,11 +712,10 @@ def _candidate_geometry_and_reflection_metrics(img, labels, label_id, bx, by, bw
 
 
 def detect(frame, exp_px, roi=None, prefer=None):
-    """Find the best red/pink circular target.
+    """Track the best round/elliptical surface.
 
-    Full-frame SEARCH/fallback detection is downscaled to reduce temporary
-    image/mask allocations.  TRACK ROI detection stays at native resolution.
-    Returned coordinates always use original-frame pixels.
+    Colour is intentionally ignored.  The detector ranks closed contours by
+    roundness / ellipse fit and proximity to the expected apparent size.
     """
     x0 = y0 = 0
     img = frame
@@ -725,8 +724,6 @@ def detect(frame, exp_px, roi=None, prefer=None):
         img = frame[y0:y1, x0:x1]
 
     scale = 1.0
-    # Only large/full-frame images are reduced. Small tracking ROIs retain
-    # native pixels for precise gimbal centring.
     if roi is None and DETECT_FULL_SCALE < 0.999:
         scale = float(DETECT_FULL_SCALE)
         img = cv2.resize(
@@ -734,94 +731,130 @@ def detect(frame, exp_px, roi=None, prefer=None):
         )
 
     exp_work = max(float(exp_px) * scale, 1e-6)
-    prefer_work = None
-    if prefer is not None:
-        prefer_work = ((prefer[0] - x0) * scale,
-                       (prefer[1] - y0) * scale)
 
-    mask, red_strength, pink_circle_mask = _red_and_pink_circle_masks(img)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
 
-    best, best_cost = None, float("inf")
-    for i in range(1, n):
-        bx, by, bw, bh, area = stats[i]
-        if area < MIN_AREA_PX:
+    contours, _ = cv2.findContours(
+        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    best = None
+    best_cost = float("inf")
+
+    for contour in contours:
+        if len(contour) < 5:
             continue
 
-        # The 200 mm target size is converted to exp_work for the current
-        # distance/slant angle. Validate every colour branch against that dynamic
-        # size instead of letting pink objects bypass the size check.
-        metrics = _candidate_geometry_and_reflection_metrics(
-            img, labels, i, bx, by, bw, bh
+        area = abs(cv2.contourArea(contour))
+        if area < 8:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+
+        # Round surfaces keep several vertices when their contour is simplified.
+        # Rectangles/squares collapse to four corners and are rejected directly.
+        approx = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
+        if len(approx) < 6:
+            continue
+
+        circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+        if circularity < 0.50:
+            continue
+
+        ellipse = cv2.fitEllipse(contour)
+        (_, _), (ew, eh), _ = ellipse
+        if ew <= 0 or eh <= 0:
+            continue
+
+        major = max(ew, eh)
+        minor = min(ew, eh)
+        aspect = major / max(minor, 1.0)
+
+        # Allow perspective distortion, but reject very line-like shapes.
+        if aspect > 4.0:
+            continue
+
+        # Compare contour area with fitted ellipse area.
+        ellipse_area = math.pi * (ew * 0.5) * (eh * 0.5)
+        if ellipse_area <= 0:
+            continue
+        area_ratio = area / ellipse_area
+        if not (0.55 <= area_ratio <= 1.35):
+            continue
+
+        # Direct round-surface test: compare the filled contour with its fitted
+        # ellipse. Corners and rectangular reflections fail this overlap test.
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+        roi_contour = contour.copy()
+        roi_contour[:, 0, 0] -= x
+        roi_contour[:, 0, 1] -= y
+
+        contour_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(contour_mask, [roi_contour], -1, 255, cv2.FILLED)
+
+        ellipse_mask = np.zeros((h, w), dtype=np.uint8)
+        local_ellipse = (
+            (ellipse[0][0] - x, ellipse[0][1] - y),
+            ellipse[1],
+            ellipse[2],
         )
-        if metrics is None:
+        cv2.ellipse(ellipse_mask, local_ellipse, 255, cv2.FILLED)
+
+        inter = cv2.countNonZero(cv2.bitwise_and(contour_mask, ellipse_mask))
+        union = cv2.countNonZero(cv2.bitwise_or(contour_mask, ellipse_mask))
+        ellipse_iou = inter / float(union) if union else 0.0
+        if ellipse_iou < 0.82:
             continue
-        (
-            major, aspect, rotated_fill, colour_coverage, highlight_fraction,
-            circularity, solidity, ellipse_error
-        ) = metrics
+
         ratio = major / exp_work
-
-        if not (TARGET_SIZE_RATIO[0] <= ratio <= TARGET_SIZE_RATIO[1]):
-            continue
-        if aspect > TARGET_MAX_PERSPECTIVE_ASPECT:
-            continue
-        if major >= 8:
-            if not (TARGET_MIN_ROTATED_FILL <= rotated_fill <= TARGET_MAX_ROTATED_FILL):
-                continue
-            if colour_coverage < TARGET_MIN_COLOUR_COVERAGE:
-                continue
-            if highlight_fraction > TARGET_MAX_NEUTRAL_HIGHLIGHT:
-                continue
-            if circularity < TARGET_MIN_CIRCULARITY:
-                continue
-            if solidity < TARGET_MIN_SOLIDITY:
-                continue
-            if ellipse_error > TARGET_MAX_ELLIPSE_ERROR:
-                continue
-        if max(bw, bh) >= 8 and area / float(bw * bh) < MIN_FILL:
+        if not (0.30 <= ratio <= 3.0):
             continue
 
-        # Ranking now strongly prefers clean circular/elliptical targets.
-        cost = abs(math.log(max(ratio, 1e-6)))
-        cost += (1.0 - min(circularity, 1.0)) * 1.8
-        cost += (1.0 - min(solidity, 1.0)) * 2.0
-        cost += ellipse_error * 2.2
-        cost += highlight_fraction * 1.5
-        if prefer_work is not None:
-            cxw, cyw = bx + bw / 2, by + bh / 2
+        M = cv2.moments(contour)
+        if M["m00"] == 0:
+            continue
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+
+        cost = 0.0
+        cost += abs(math.log(max(ratio, 1e-6)))
+        cost += (1.0 - min(circularity, 1.0)) * 2.0
+        cost += abs(1.0 - area_ratio) * 1.2
+        cost += (1.0 - ellipse_iou) * 2.0
+
+        if prefer is not None:
+            px = (prefer[0] - x0) * scale
+            py = (prefer[1] - y0) * scale
             denom = max(ROI_HALF_MIN * scale, 4 * exp_work, 1.0)
-            cost += math.hypot(cxw - prefer_work[0],
-                               cyw - prefer_work[1]) / denom
+            cost += math.hypot(cx - px, cy - py) / denom
+
         if cost < best_cost:
-            best_cost, best = cost, (i, bx, by, bw, bh, area)
+            best_cost = cost
+            best = {
+                "cx": cx,
+                "cy": cy,
+                "major": major,
+                "minor": minor,
+                "area": area,
+            }
 
     if best is None:
-        return None, mask
-
-    i, bx, by, bw, bh, area = best
-
-    # Channel slicing avoids three extra copies.
-    g = img[:, :, 1]
-    r = img[:, :, 2]
-    colour_strength = cv2.max(red_strength, cv2.subtract(r, g))
-    component = (labels[by:by + bh, bx:bx + bw] == i)
-    patch = colour_strength[by:by + bh, bx:bx + bw].astype(np.float32)
-    patch *= component
-    m = cv2.moments(patch)
-    local_x = bx + (m["m10"] / m["m00"] if m["m00"] else bw / 2)
-    local_y = by + (m["m01"] / m["m00"] if m["m00"] else bh / 2)
+        return None, edges
 
     inv = 1.0 / scale
-    cx = x0 + local_x * inv
-    cy = y0 + local_y * inv
-    return dict(
-        x=cx,
-        y=cy,
-        w=int(round(bw * inv)),
-        h=int(round(bh * inv)),
-        area=int(round(area * inv * inv)),
-    ), mask
+    return {
+        "x": x0 + best["cx"] * inv,
+        "y": y0 + best["cy"] * inv,
+        "w": int(round(best["major"] * inv)),
+        "h": int(round(best["minor"] * inv)),
+        "area": int(round(best["area"] * inv * inv)),
+    }, edges
 
 
 # --------------------------- main loop ---------------------------
@@ -999,10 +1032,6 @@ def run(args):
                     frame, None, fx=ds, fy=ds, interpolation=cv2.INTER_AREA
                 )
                 vH, vW = view.shape[:2]
-
-                # Colour correction is done only on the already-small preview.
-                preview_target_mask, _, _ = _red_and_pink_circle_masks(view)
-                view[preview_target_mask != 0] = (0, 0, 255)
 
                 cv2.drawMarker(
                     view, (vW // 2, vH // 2), (255, 255, 255),
