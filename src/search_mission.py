@@ -53,12 +53,21 @@ class SearchMission:
         if usable:
             self.tracking = True
             self.last_seen = now
+            self.last_target = target
         if self.tracking:
             if usable:
                 # Oddělené identity: bod trasy nemůže být zaměněn za detekci.
                 self.controller.dwell = 1.
                 return self.controller.update(vehicle, replace(target, identity='target:'+target.identity), now)
             if not math.isfinite(now) or now-self.last_seen < 2:
+                last = getattr(self, 'last_target', None)
+                if last is not None and math.hypot(last.position.north_m-vehicle.position.north_m,
+                                                   last.position.east_m-vehicle.position.east_m) > .8:
+                    # Tečka se nehýbe: zmizela-li na okraji záběru, dolétnout k místu,
+                    # kde byla naposledy vidět, místo zastavení (jinak ji dron na okraji ztratí).
+                    command = self.controller.update(
+                        vehicle, replace(last, sampled_at=now, identity='target:'+last.identity), now)
+                    return replace(command, state='TARGET_LOST_HOLD')
                 command = self.controller.update(vehicle, None, now)
                 return replace(command, state='TARGET_LOST_HOLD' if command.state == 'TARGET_LOST' else command.state)
             self.tracking = False

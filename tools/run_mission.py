@@ -28,15 +28,22 @@ def main():
     parser.add_argument('--target-loss', nargs=2, type=float, metavar=('START', 'END'))
     parser.add_argument('--fault', choices=('telemetry', 'map', 'camera', 'camera_unlocked', 'manual', 'stop', 'reject_arm', 'no_climb'))
     parser.add_argument('--fault-at', type=float, default=20.)
+    parser.add_argument('--precision-loops', type=int, default=2, help='Měření červená+zelená po nalezení (0 = vypnuto).')
+    parser.add_argument('--gps-drift', type=float, default=.5, help='Směrodatná odchylka ujíždění GPS/EKF v m.')
+    parser.add_argument('--camera-noise', type=float, default=.05, help='Šum polohy bodu z kamery v m.')
+    parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--finish', choices=('hold', 'land'), default='hold')
     parser.add_argument('--output', type=Path, help='JSONL celé mise; přepíše zadaný soubor.')
     args = parser.parse_args()
     try:
         settings = MissionSettings(StartReference(*args.start), tuple(args.field_bounds),
-                                   args.height, args.lane_spacing, args.mission_timeout, args.max_speed)
+                                   args.height, args.lane_spacing, args.mission_timeout, args.max_speed,
+                                   precision_loops=args.precision_loops, finish=args.finish)
         rows = simulate_mission(settings, seconds=args.seconds, no_target=args.no_target,
                                 moving=args.moving, fault=args.fault, fault_at=args.fault_at,
                                 target_loss=args.target_loss,
-                                tapes=[((t[0], t[1]), (t[2], t[3])) for t in args.tape], target_at=tuple(args.target))
+                                tapes=[((t[0], t[1]), (t[2], t[3])) for t in args.tape], target_at=tuple(args.target),
+                                gps_drift_m=args.gps_drift, camera_noise_m=args.camera_noise, seed=args.seed)
         if args.output:
             with args.output.open('w', encoding='utf-8') as stream:
                 for row in rows:
@@ -55,8 +62,15 @@ def main():
     if rows[-1]['tape_lines']:
         print('PASKA (sever1, vychod1, sever2, vychod2):', [[round(v, 2) for v in l] for l in rows[-1]['tape_lines']])
         print(f"nejsevernejsi poloha: {max(r['north_m'] for r in rows):.2f} m")
-    if rows[-1]['mission']['target_result']:
-        print(json.dumps(rows[-1]['mission']['target_result'], allow_nan=False))
+    result = rows[-1]['mission']['target_result']
+    if result:
+        if result.get('method') == 'green_relative':
+            n, e = result['north_from_green_m'], result['east_from_green_m']
+        else:
+            n, e = result['north_m'], result['east_m']
+        tn, te = args.target
+        print(f"VÝSLEDEK ({result['method']}): S {n:+.3f} m, V {e:+.3f} m od zelené; "
+              f"skutečnost S {tn:+.3f}, V {te:+.3f}; CHYBA {((n-tn)**2+(e-te)**2)**.5*100:.1f} cm")
 
 
 if __name__ == '__main__':

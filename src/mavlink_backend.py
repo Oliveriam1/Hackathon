@@ -35,6 +35,7 @@ MAV_FRAME_LOCAL_NED = 1
 MAV_LANDED_STATE_ON_GROUND = 1
 MAV_AUTOPILOT_ARDUPILOTMEGA = 3
 VELOCITY_ONLY_MASK = 3527       # ignorovat polohu, zrychlení, yaw a yaw rate
+VELOCITY_YAW_MASK = 2503        # rychlost + pevný kurz (yaw), ignorovat polohu, zrychlení, yaw rate
 COPTER_MODES = {'STABILIZE': 0, 'ALT_HOLD': 2, 'AUTO': 3, 'GUIDED': 4, 'LOITER': 5,
                 'RTL': 6, 'LAND': 9, 'BRAKE': 17}
 COPTER_TYPES = (2, 3, 4, 13, 14, 15, 29, 35)
@@ -68,6 +69,9 @@ class ArduPilotBackend:
         self.manual = False
         self.last_sent = None
         self.boot_ms = 0
+        self.yaw = None            # rad, poslední ATTITUDE
+        self.hold_yaw = None       # rad, kurz zachycený na startu; drží se po celý let
+        self.land_sent = False
 
     # ---------------------------------------------------------------- příjem
     def ingest(self, message, now=None):
@@ -83,7 +87,7 @@ class ArduPilotBackend:
                 guided = message.custom_mode == self.guided_mode
                 if guided and MAV_CMD_DO_SET_MODE in self.requested_commands:
                     self.guided_confirmed = True
-                if self.guided_confirmed and not guided and not self.manual:
+                if self.guided_confirmed and not guided and not self.manual and not self.land_sent:
                     self.manual = True
                     self.log(f'MAVLink: režim {message.custom_mode} místo GUIDED -> převzetí pilotem.')
             elif kind == 'LOCAL_POSITION_NED':
@@ -93,6 +97,9 @@ class ArduPilotBackend:
                 self.boot_ms = message.time_boot_ms
             elif kind == 'GLOBAL_POSITION_INT':
                 self.global_pos = (now, message.lat/1e7, message.lon/1e7, message.relative_alt/1000)
+            elif kind == 'ATTITUDE':
+                if math.isfinite(message.yaw):
+                    self.yaw = message.yaw
             elif kind == 'EXTENDED_SYS_STATE':
                 self.landed_state = message.landed_state
             elif kind == 'COMMAND_ACK':
@@ -166,6 +173,9 @@ class ArduPilotBackend:
             _, lat, lon, _ = self.global_pos
             self.origin = (x, y, z)
             self.start = StartReference(lat, lon)
+            # Stejný kurz po celý let: záběr kamery je vždy stejně natočený a
+            # chyby montáže kamery se v rozdílu červená-zelená odečtou.
+            self.hold_yaw = self.yaw
         return self.start
 
     def vehicle(self):
@@ -177,7 +187,7 @@ class ArduPilotBackend:
             x0, y0, z0 = self.origin
         return VehicleState(GroundPoint(x-x0, y-y0), vx, vy, at), -(z-z0), -vz
 
-    def mission_input(self, field, *, camera_ready, camera_locked, target, stop_requested=False):
+    def mission_input(self, field, *, camera_ready, camera_locked, target, stop_requested=False, green=None):
         vehicle, height, up = self.vehicle()
         if vehicle is None:
             vehicle = VehicleState(GroundPoint(math.nan, math.nan), math.nan, math.nan, math.nan)
@@ -191,7 +201,7 @@ class ArduPilotBackend:
                             guided=heartbeat[2] == self.guided_mode, armed=heartbeat[1],
                             on_ground=on_ground, camera_ready=camera_ready, camera_locked=camera_locked,
                             target=target, feedback=feedback, manual_override=manual,
-                            stop_requested=stop_requested)
+                            stop_requested=stop_requested, green=green)
 
     # ---------------------------------------------------------------- povely
     def _command(self, command, params):
@@ -211,10 +221,11 @@ class ArduPilotBackend:
         values = (north, east, down)
         if not all(math.isfinite(v) for v in values) or math.hypot(north, east) > MAX_SPEED+1e-6:
             raise ValueError('Neplatný nebo příliš rychlý povel.')
+        mask, yaw = (VELOCITY_ONLY_MASK, 0.) if self.hold_yaw is None else (VELOCITY_YAW_MASK, self.hold_yaw)
         with self._send_lock:
             self.connection.mav.set_position_target_local_ned_send(
-                self.boot_ms, self.system, self.component, MAV_FRAME_LOCAL_NED, VELOCITY_ONLY_MASK,
-                0, 0, 0, north, east, down, 0, 0, 0, 0, 0)
+                self.boot_ms, self.system, self.component, MAV_FRAME_LOCAL_NED, mask,
+                0, 0, 0, north, east, down, 0, 0, 0, yaw, 0)
         self.last_sent = (north, east, down)
 
     def execute(self, command):
@@ -250,6 +261,12 @@ class ArduPilotBackend:
                 down = -max(-MAX_CLIMB, min(MAX_CLIMB, .8*(command.height_setpoint_m-height)))
             self._velocity(command.north_m_s, command.east_m_s, down)
             return 'VELOCITY'
+        if action == 'LAND':
+            if guided and armed and not self.land_sent:
+                self.set_mode('LAND')
+                self.land_sent = True
+                return 'SET_MODE_LAND'
+            return 'NONE'
         # WAIT, TAKEOFF_MONITOR (vzlet řídí autopilot), RELEASE, NONE, HOLD: nic neposílat.
         return 'NONE'
 

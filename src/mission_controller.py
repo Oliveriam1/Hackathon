@@ -1,9 +1,10 @@
 """Společný řadič mise: čisté záměry a stav, žádný přístup k hardwaru."""
 import math
 from dataclasses import dataclass
-from .approach import ApproachCommand, TargetEstimate, VehicleState
+from .approach import ApproachCommand, ApproachController, TargetEstimate, VehicleState
 from .config import StartReference
-from .field import FieldMap
+from .field import FieldMap, GroundPoint
+from .precision import SampleCollector, solve
 from .search_mission import SearchMission
 from .search_planner import RectangleSweep
 from .takeoff import TakeoffController
@@ -20,8 +21,15 @@ class MissionSettings:
     # Při kameře kolmo dolů vidí dron pásku jen ~1.9 m dopředu (5 m, OV5647).
     # Rychlost musí dovolit zastavit před ní: rezerva + reakce + brzdná dráha.
     max_speed_m_s: float = 1.
+    # Přesné měření vůči zelené tečce, na které dron startuje (viz precision.py).
+    # 0 = vypnuto (výsledek jen z GPS). Každá smyčka = měření červené + zelené.
+    precision_loops: int = 0
+    green: StartReference | None = None   # známá souřadnice zelené; None = GPS startu
+    finish: str = 'hold'                  # 'hold' nad zelenou, nebo 'land'
 
     def __post_init__(self):
+        if not 0 <= self.precision_loops <= 5 or self.finish not in ('hold', 'land'):
+            raise ValueError('precision_loops 0-5, finish hold/land.')
         if (not math.isfinite(self.timeout_s) or self.timeout_s <= 0 or
                 not math.isfinite(self.start.latitude_deg) or abs(self.start.latitude_deg) >= 89.9 or
                 not math.isfinite(self.start.longitude_deg)):
@@ -54,6 +62,7 @@ class MissionInput:
     feedback: CommandFeedback | None = None
     manual_override: bool = False
     stop_requested: bool = False
+    green: TargetEstimate | None = None   # zelená tečka změřená kamerou (lokální soustava)
 
 
 @dataclass(frozen=True)
@@ -103,6 +112,14 @@ class MissionController:
         self.guard = ZoneGuard()
         self.airborne = False
         self.last_tape_lines = ()
+        self.phase = None           # fáze přesného měření, None = hledání
+        self.phase_since = None
+        self.collector = None
+        self.measurements = []
+        self.loops_done = 0
+        self.red_point = self.green_point = self.hover_point = None
+        self.nav = None
+        self.precision_result = None
         self.speed_cap = (min(settings.max_speed_m_s, max(.2, tape_safe_speed(settings.height_m)))
                           if settings else None)
 
@@ -113,6 +130,8 @@ class MissionController:
                     waypoint_count=len(self.search.sweep.points) if self.search else None,
                     target_result=self.last_result, flight_ready=False,
                     tape_lines=len(self.last_tape_lines), speed_cap_m_s=self.speed_cap,
+                    precision_phase=self.phase, precision_loops_done=self.loops_done,
+                    measurements=len(self.measurements),
                     execution='controller_only_no_hardware')
 
     def output(self, reason, **kwargs):
@@ -144,6 +163,9 @@ class MissionController:
             return self.output('STOP_REQUESTED', action='BRAKE')
         if self.state == 'FAILSAFE':
             return self.output(self.reason, action='BRAKE')
+        if self.state == 'LANDING':
+            # Přistání vede autopilot (režim LAND); řadič už nic nepřikazuje.
+            return self.output('PRECISION_DONE_LANDING', action='LAND')
         if (not math.isfinite(now) or
                 self.last_time is not None and not 0 < now-self.last_time <= .3):
             return self.fail('CONTROL_CLOCK_INVALID_OR_GAP')
@@ -241,6 +263,9 @@ class MissionController:
             self.pending = None
             self.airborne = True
             self.state = 'SEARCHING'
+            if self.settings.precision_loops:
+                self.hover_point = data.vehicle.position  # zelená je pod místem vzletu
+                self.start_phase('MEASURE_GREEN_START', now, 'green')
         if data.on_ground or abs(data.height_m-self.settings.height_m) > .75:
             return self.fail('FLIGHT_HEIGHT_LOST')
         # Zpomalovat předem podle volného prostoru, ne opakovaně rozjíždět/brzdit.
@@ -248,6 +273,8 @@ class MissionController:
         ar = self.guard.acceleration*self.guard.reaction_time
         speed_limit = math.sqrt(ar*ar+2*self.guard.acceleration*room)-ar
         self.search.controller.speed = min(self.speed_cap, max(.01, speed_limit))
+        if self.phase is not None:
+            return self.precision_step(data, now)
         command = self.search.update(data.vehicle, data.target, now, data.field)
         zone = self.guard.check(data.field, data.vehicle, command, now)
         self.zone_state = zone.state
@@ -275,8 +302,104 @@ class MissionController:
                                     longitude_deg=(lon+180)%360-180, north_m=point.north_m,
                                     east_m=point.east_m, sampled_at=data.target.sampled_at,
                                     horizontal_error_estimate_m=data.target.error_m,
-                                    datum='WGS84', historical_observation=True)
+                                    datum='WGS84', historical_observation=True, method='gps_only')
+            if self.settings.precision_loops:
+                self.red_point = point
+                self.start_phase('MEASURE_RED', now, 'red')
         return self.output(command.state, action='VELOCITY', north_m_s=command.north_m_s,
                            east_m_s=command.east_m_s, height_setpoint_m=self.settings.height_m,
                            camera_action='TRACK' if tracking else 'SEARCH',
                            target_id=data.target.identity if tracking else None)
+
+    # ------------------------------------------------------------------ přesné měření
+    # Když bod po návratu není v záběru (drift GPS), obhlédne okolí po čtverci.
+    LOOK_AROUND = ((0., 0.), (1.5, 0.), (1.5, 1.5), (0., 1.5), (-1.5, 1.5), (-1.5, 0.),
+                   (-1.5, -1.5), (0., -1.5), (1.5, -1.5), (3., 0.), (0., 3.), (-3., 0.), (0., -3.))
+
+    def start_phase(self, phase, now, kind=None):
+        self.phase, self.phase_since = phase, now
+        self.look_index = 0
+        self.collector = SampleCollector(kind) if kind else None
+        self.nav = ApproachController(bounds=self.settings.bounds, speed=self.speed_cap, dwell=.5)
+        self.nav.last_time = now-.05
+
+    def finish_measurement(self):
+        result = self.collector.result() if self.collector else None
+        if result is not None and result.samples >= 5:
+            self.measurements.append(result)
+            if result.kind == 'green':
+                self.green_point = result.point
+            else:
+                self.red_point = result.point
+            return True
+        return False
+
+    def solve(self):
+        green = self.settings.green or self.settings.start
+        result = solve(self.measurements, green.latitude_deg, green.longitude_deg)
+        if result is not None:
+            result.update(method='green_relative', green_reference='given' if self.settings.green else 'start_gps')
+            self.precision_result = self.last_result = result
+
+    def precision_step(self, data, now):
+        """Střídání měření R/G v krátkém sledu, aby se drift EKF v rozdílu vyrušil."""
+        phase = self.phase
+        elapsed = now-self.phase_since
+        home = self.green_point or GroundPoint(0., 0.)
+        if phase == 'MEASURE_GREEN_START':
+            aim, sample, limit = self.hover_point, data.green, 8.
+        elif phase in ('MEASURE_RED', 'MEASURE_GREEN'):
+            seen = data.target if phase == 'MEASURE_RED' else data.green
+            base = self.red_point if phase == 'MEASURE_RED' else home
+            fresh = seen is not None and now-seen.sampled_at <= .25
+            if fresh:
+                aim = seen.position
+            else:
+                dn, de = self.LOOK_AROUND[min(self.look_index, len(self.LOOK_AROUND)-1)]
+                aim = GroundPoint(base.north_m+dn, base.east_m+de)
+            sample, limit = seen, 45.
+        elif phase == 'RETURN_GREEN':
+            aim, sample, limit = home, None, 60.
+        elif phase == 'RETURN_RED':
+            aim, sample, limit = self.red_point, None, 60.
+        else:  # DONE
+            aim, sample, limit = home, None, math.inf
+        command = self.nav.update(data.vehicle, TargetEstimate(aim, now, f'{phase}:{self.look_index}'), now)
+        steady = command.state in ('SETTLING', 'ARRIVED')
+        if phase in ('MEASURE_RED', 'MEASURE_GREEN') and not fresh and command.state == 'ARRIVED':
+            self.look_index += 1  # bod nenalezen tady, zkus další místo v okolí
+        if sample is not None and steady:
+            self.collector.add(sample)
+        # Přechody fází.
+        if phase.startswith('MEASURE') and (self.collector.done or elapsed > limit):
+            ok = self.finish_measurement()
+            if phase == 'MEASURE_GREEN_START':
+                self.start_phase('SEARCH', now)
+                self.phase = None
+                self.reason = 'GREEN_START_MEASURED' if ok else 'GREEN_NOT_SEEN_AT_START'
+            elif phase == 'MEASURE_RED':
+                self.start_phase('RETURN_GREEN', now)
+            else:
+                self.loops_done += 1
+                self.solve()
+                if self.loops_done < self.settings.precision_loops:
+                    self.start_phase('RETURN_RED', now)
+                else:
+                    self.start_phase('DONE', now)
+        elif phase in ('RETURN_GREEN', 'RETURN_RED') and command.state == 'ARRIVED':
+            self.start_phase('MEASURE_GREEN' if phase == 'RETURN_GREEN' else 'MEASURE_RED', now,
+                             'green' if phase == 'RETURN_GREEN' else 'red')
+        elif phase.startswith('RETURN') and elapsed > limit:
+            return self.fail('PRECISION_NAV_TIMEOUT')
+        self.state = self.phase or 'SEARCHING'
+        zone = self.guard.check(data.field, data.vehicle, command, now)
+        self.zone_state = zone.state
+        if not zone.allowed:
+            self.nav.hold(zone.state)
+            return self.output(zone.state, action='BRAKE', height_setpoint_m=self.settings.height_m)
+        if self.state == 'DONE' and self.settings.finish == 'land' and command.state == 'ARRIVED':
+            self.state = 'LANDING'
+            return self.output('PRECISION_DONE_LANDING', action='LAND')
+        return self.output(command.state, action='VELOCITY', north_m_s=command.north_m_s,
+                           east_m_s=command.east_m_s, height_setpoint_m=self.settings.height_m,
+                           camera_action='MEASURE')

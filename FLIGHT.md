@@ -32,6 +32,48 @@ Rychlost je omezená tak, aby dron stihl zastavit před páskou, kterou uvidí a
 na okraji záběru: 5 m → 1.24 m/s, 4 m → 1.0 m/s, 8 m → 1.8 m/s (a nejvýš
 `--max-speed`, výchozí 1 m/s). Pod 4 m výšky kamera vidí pásku příliš pozdě.
 
+## Přesné měření červené vůči zelené (cíl: chyba pod 25 cm)
+
+Dron vždy startuje na zelené tečce se známou souřadnicí. GPS dronu během letu
+ujíždí (typicky 0.3–2 m za pár minut), a proto se souřadnice červené počítá
+z rozdílu dvou kamerových měření:
+
+`červená = zadaná zelená + (červená změřená − zelená změřená)`
+
+Průběh po nalezení červené (`--precision-loops 2`, výchozí):
+
+1. `MEASURE_GREEN_START` – hned po vzletu visí nad zelenou, 15 měření.
+2. `MEASURE_RED` – visí nad červenou, kamera kolmo dolů, 15 měření (medián).
+3. `RETURN_GREEN` → `MEASURE_GREEN` – zpět nad zelenou, znovu změřit.
+4. `RETURN_RED` → `MEASURE_RED` → `RETURN_GREEN` → `MEASURE_GREEN` – druhé kolo.
+5. `DONE` – poloha zelené v čase měření červené se interpoluje ze sousedních
+   měření zelené, takže se lineární část driftu GPS odečte. Výsledek: WGS84
+   souřadnice, vzdálenost a azimut od zelené.
+
+Když bod po návratu není v záběru (drift), dron obhlédne okolí po čtverci.
+Po celý let drží stejný kurz (yaw ze startu), aby byl záběr kamery vždy stejně
+natočený a chyba montáže kamery se v rozdílu odečetla. `--finish land` na konci
+přistane na zelené.
+
+```bash
+python3 tools/fly_mission.py --connect /dev/serial0 --baud 921600 --real-flight \
+    --field-bounds -10 10 -10 10 --green 50.0875123 14.4213456 --green-diameter-m 0.2
+python3 tools/run_mission.py --gps-drift 0.5 --camera-noise 0.1     # simulace s driftem
+```
+
+**Bez `--green` se jako zelená použije GPS startu** – vzdálenost od zelené je
+pak přesná, ale absolutní souřadnice nesou chybu GPS (metry). Souřadnici zelené
+tedy vždy zadejte.
+
+Simulace (12 běhů, drift GPS 0.5 m, šum kamery 10 cm): jen z GPS medián 58 cm,
+pod 25 cm 1 z 11; se zelenou medián 5.5 cm, max 16 cm, pod 25 cm 11 z 11.
+Simulace ale předpokládá nezkreslený šum kamery – skutečnou přesnost ověřte
+na zemi: položte červenou tečku do známé vzdálenosti od zelené a porovnejte.
+
+Detektor zelené (`marker_detector.py`) hledá sytě zelený kulatý izolovaný bod
+o velikosti odpovídající `--green-diameter-m` a výšce; tráva by neměla projít.
+Prahy HSV je nutné ověřit na skutečném poli (diagnostické snímky).
+
 ## Převzetí a poruchy
 
 - **Přepnutí režimu na vysílačce** (LOITER/ALT_HOLD/…) = okamžité převzetí.
