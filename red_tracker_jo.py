@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Red-target gimbal tracker for a drone-mounted, downward-looking camera (Raspberry Pi 3)
-=========a============================================================================
+=====================================================================================
 Scenario: 60 x 30 m concrete field, 200 mm red disc lying somewhere on it, drone hovering
 at ~20 m with RTK/GNSS position. A 2-axis servo gimbal points the camera.
 
@@ -425,6 +425,64 @@ def _score(c, size_ref, size_range, prefer, prefer_scale):
     return cost
 
 
+
+def _shape_candidates(img, ref, size_range, prefer=None, prefer_scale=1.0):
+    """Yield ellipse-like contours independent of colour.
+
+    Used as a fallback in SEARCH/bench and TRACK. The expected 200 mm target
+    size still constrains the candidate, so arbitrary circles in the scene are
+    not accepted without limit.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 45, 135)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, MORPH_KERNEL_3)
+
+    cnts, _ = cv2.findContours(
+        edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE
+    )
+
+    out = []
+    for cnt in cnts:
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        major_bb = max(bw, bh)
+        minor_bb = max(1, min(bw, bh))
+
+        if major_bb < max(SMALL_BLOB_PX, size_range[0] * ref * 0.65):
+            continue
+        if major_bb > size_range[1] * ref * 1.35:
+            continue
+        if major_bb / float(minor_bb) > MAX_ASPECT:
+            continue
+
+        per = cv2.arcLength(cnt, True)
+        if per <= 0:
+            continue
+
+        # Reject obvious rectangles/squares and jagged reflections.
+        approx = cv2.approxPolyDP(cnt, 0.02 * per, True)
+        if len(approx) < 6:
+            continue
+
+        local = cnt - np.array([bx, by])
+        c = _ellipse_check(local, bw, bh, bx, by)
+        if c is None:
+            continue
+
+        # Shape-only candidates should match the fitted ellipse very well.
+        if c["iou"] < max(MIN_ELLIPSE_IOU, 0.80):
+            continue
+
+        cost = _score(c, ref, size_range, prefer, prefer_scale)
+        if cost is None:
+            continue
+
+        c["source"] = "shape"
+        out.append((cost, c))
+
+    return out
+
+
 def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO, shape_fallback=False):
     """Find the red/pink disc (circle or tilted ellipse).
 
@@ -475,22 +533,20 @@ def detect(frame, size_ref, roi=None, prefer=None, size_range=SEARCH_SIZE_RATIO,
         if cost is not None and cost < best_cost:
             best_cost, best, c["source"] = cost, c, "colour"
 
-    # Shape-only fallback near the last position (glare/shadow can kill colour for a moment).
-    if best is None and shape_fallback and pref is not None:
-        gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-        edges = cv2.dilate(cv2.Canny(gray, 40, 120), MORPH_KERNEL_3)
-        cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)   # LIST: inner shapes too
-        for cnt in cnts:
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            if max(bw, bh) < max(SMALL_BLOB_PX, 0.5 * ref) or max(bw, bh) > 2.0 * ref:
-                continue
-            local = cnt - np.array([bx, by])
-            c = _ellipse_check(local, bw, bh, bx, by)
-            if c is None or math.hypot(c["cx"] - pref[0], c["cy"] - pref[1]) > 1.0 * ref:
-                continue
-            cost = _score(c, ref, (0.6, 1.6), pref, pscale)
-            if cost is not None and cost < best_cost:
-                best_cost, best, c["source"] = cost, c, "shape"
+    # Shape fallback:
+    # - in TRACK, keep the target alive when colour is lost by glare/shadow;
+    # - in SEARCH/bench, allow a clearly round 200 mm surface to be acquired
+    #   even when the NoIR colour rendering is poor.
+    use_shape = shape_fallback or (roi is None)
+    if best is None and use_shape:
+        shape_range = (0.45, 1.8) if (shape_fallback and pref is not None) else size_range
+        for cost, c in _shape_candidates(
+                img, ref, shape_range, prefer=pref, prefer_scale=pscale):
+            if pref is not None:
+                if math.hypot(c["cx"] - pref[0], c["cy"] - pref[1]) > 1.25 * max(ref, 1.0):
+                    continue
+            if cost < best_cost:
+                best_cost, best = cost, c
 
     if best is None:
         return None, mask
@@ -864,17 +920,34 @@ def run(args):
                 cv2.drawMarker(view, (vW // 2, vH // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
                 if det is not None:
                     c = (int(round(det["x"] * ds)), int(round(det["y"] * ds)))
-                    axes = (max(3, int(det["w"] * ds / 2)), max(2, int(det["h"] * ds / 2)))
-                    cv2.ellipse(view, c, axes, det["angle"], 0, 360, colour, 2)
+                    axes = (max(3, int(det["w"] * ds / 2)),
+                            max(2, int(det["h"] * ds / 2)))
+
+                    # Restore the old behaviour: the actually detected circular/
+                    # elliptical target is visibly filled red in the preview.
+                    cv2.ellipse(view, c, axes, det["angle"], 0, 360,
+                                (0, 0, 255), -1)
+                    cv2.ellipse(view, c, axes, det["angle"], 0, 360,
+                                (255, 255, 255), 2)
                     cv2.line(view, (vW // 2, vH // 2), c, colour, 1)
                 if geometry is not None:
                     q = np.rint(geometry["contour"].astype(np.float32) * ds).astype(np.int32)
                     cv2.drawContours(view, [q], -1, (255, 0, 255), 1)
                 cv2.putText(view, state, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
-                if geometry is not None:
-                    tilt_text = f"{geometry['angle']:+.1f}" if geometry["angle"] is not None else "N/A"
-                    cv2.putText(view, f"Viditelne kruhy: {len(geometry['circles'])}  Naklon: {tilt_text}",
-                                (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # A tracked round target counts as visible even when there is
+                # no surrounding quadrilateral in the current bench test.
+                shown_circle_count = len(geometry["circles"]) if geometry is not None else 0
+                if det is not None:
+                    shown_circle_count = max(1, shown_circle_count)
+                tilt_text = (
+                    f"{geometry['angle']:+.1f}"
+                    if geometry is not None and geometry["angle"] is not None
+                    else "N/A"
+                )
+                cv2.putText(view,
+                            f"Viditelne kruhy: {shown_circle_count}  Naklon: {tilt_text}",
+                            (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (255, 255, 255), 1)
                 if det is not None:
                     cv2.putText(view, f"disc tilt {det['tilt']:.0f} deg [{det['source']}]", (10, 74),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
