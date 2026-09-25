@@ -105,6 +105,20 @@ QUAD_MAX_FRAME_FRACTION = 0.95
 CIRCLE_MIN_AREA_PX = 12
 CIRCLE_MIN_CIRCULARITY = 0.68
 CIRCLE_MAX_ASPECT_RATIO = 1.45
+
+# --- performance / memory ---
+# Full-frame search is downscaled; TRACK keeps using the existing small ROI at
+# native resolution so centring accuracy is preserved.
+DETECT_FULL_SCALE = 0.67
+# Quadrilateral/tilt analysis is both downscaled and throttled.  At a 30 FPS
+# camera this still updates roughly 10 times per second.
+GEOMETRY_SCALE = 0.50
+GEOMETRY_EVERY_N_FRAMES = 3
+# The preview was already displayed at half size.  Build it directly at that
+# size instead of copying and processing a full-resolution display frame.
+DISPLAY_SCALE = 0.50
+# Reuse the morphology kernel instead of allocating it every call.
+MORPH_KERNEL_3 = np.ones((3, 3), np.uint8)
 # =====================================================================
 
 F_X = (CAPTURE_W / 2) / math.tan(math.radians(HFOV_DEG / 2))  # focal length in px
@@ -198,7 +212,7 @@ class Camera:
             cfg = self.cam.create_video_configuration(
                 main={"size": (CAPTURE_W, CAPTURE_H), "format": "RGB888"},  # BGR order in numpy
                 transform=Transform(hflip=CAM_ROTATE_180, vflip=CAM_ROTATE_180),
-                buffer_count=3)
+                buffer_count=2)
             self.cam.configure(cfg)
             self.cam.start()
             time.sleep(1.5)  # auto exposure / white balance settle
@@ -349,26 +363,39 @@ def _contour_center(contour):
 def analyze_object_geometry(frame, prefer=None):
     """Find the main quadrilateral and circular contours inside it.
 
-    This intentionally uses only cheap operations: grayscale conversion,
-    Canny edges, contour geometry, polygon tests and circularity.  No temporal
-    image filters or expensive model-based processing are used.
-
-    Returns a dict with: contour, angle, center, circles; or None when no
-    suitable quadrilateral is visible.
+    The expensive edge/contour work is performed on a downscaled frame and all
+    coordinates are mapped back to the original frame before returning.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    scale = float(GEOMETRY_SCALE)
+    if not (0.0 < scale <= 1.0):
+        scale = 1.0
+
+    if scale < 0.999:
+        work = cv2.resize(
+            frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+        )
+        prefer_work = ((prefer[0] * scale, prefer[1] * scale)
+                       if prefer is not None else None)
+    else:
+        work = frame
+        prefer_work = prefer
+
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 60, 180, apertureSize=3, L2gradient=False)
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
-    frame_area = frame.shape[0] * frame.shape[1]
+    area_scale = scale * scale
+    frame_area = work.shape[0] * work.shape[1]
+    min_quad_area = max(4.0, QUAD_MIN_AREA_PX * area_scale)
     max_quad_area = frame_area * QUAD_MAX_FRAME_FRACTION
+    min_circle_area = max(2.0, CIRCLE_MIN_AREA_PX * area_scale)
     candidates = []
 
     for contour in contours:
         area = abs(cv2.contourArea(contour))
-        if area < QUAD_MIN_AREA_PX or area > max_quad_area:
+        if area < min_quad_area or area > max_quad_area:
             continue
         perimeter = cv2.arcLength(contour, True)
         if perimeter <= 0.0:
@@ -378,12 +405,10 @@ def analyze_object_geometry(frame, prefer=None):
             continue
 
         contains_preferred = False
-        if prefer is not None:
+        if prefer_work is not None:
             contains_preferred = cv2.pointPolygonTest(
-                approx, (float(prefer[0]), float(prefer[1])), False
+                approx, (float(prefer_work[0]), float(prefer_work[1])), False
             ) >= 0
-        # Prefer a quadrilateral containing the currently tracked red target;
-        # otherwise fall back to the largest valid quadrilateral.
         candidates.append((1 if contains_preferred else 0, area, approx))
 
     if not candidates:
@@ -397,7 +422,7 @@ def analyze_object_geometry(frame, prefer=None):
     circle_candidates = []
     for contour in contours:
         area = abs(cv2.contourArea(contour))
-        if area < CIRCLE_MIN_AREA_PX or area >= quad_area * 0.35:
+        if area < min_circle_area or area >= quad_area * 0.35:
             continue
         perimeter = cv2.arcLength(contour, True)
         if perimeter <= 0.0:
@@ -418,38 +443,59 @@ def analyze_object_geometry(frame, prefer=None):
             continue
         circle_candidates.append((area, (cx, cy), contour))
 
-    # An edge image can produce an inner and outer contour for the same ring.
-    # Keep only one contour per visible circle by merging close centroids.
     circle_candidates.sort(key=lambda item: item[0], reverse=True)
     circles = []
     for area, center, contour in circle_candidates:
         _, radius = cv2.minEnclosingCircle(contour)
         duplicate = False
         for kept in circles:
-            dist = math.hypot(center[0] - kept["center"][0], center[1] - kept["center"][1])
-            if dist <= max(4.0, 0.5 * max(radius, kept["radius"])):
+            dist = math.hypot(center[0] - kept["center"][0],
+                              center[1] - kept["center"][1])
+            if dist <= max(4.0 * scale, 0.5 * max(radius, kept["radius_work"])):
                 duplicate = True
                 break
         if not duplicate:
             circles.append({
-                "center": center,
-                "radius": float(radius),
-                "area": float(area),
-                "contour": contour,
+                "center_work": center,
+                "radius_work": float(radius),
+                "area_work": float(area),
+                "contour_work": contour,
             })
 
+    inv = 1.0 / scale
+    quad_out = np.rint(quad.astype(np.float32) * inv).astype(np.int32)
+    rect_out = (
+        (rect[0][0] * inv, rect[0][1] * inv),
+        (rect[1][0] * inv, rect[1][1] * inv),
+        rect[2],
+    )
+    circles_out = []
+    for circle in circles:
+        circles_out.append({
+            "center": (circle["center_work"][0] * inv,
+                       circle["center_work"][1] * inv),
+            "radius": circle["radius_work"] * inv,
+            "area": circle["area_work"] * inv * inv,
+            "contour": np.rint(
+                circle["contour_work"].astype(np.float32) * inv
+            ).astype(np.int32),
+        })
+
     return {
-        "contour": quad,
-        "rect": rect,
+        "contour": quad_out,
+        "rect": rect_out,
         "angle": tilt,
-        "center": quad_center,
-        "circles": circles,
+        "center": (quad_center[0] * inv, quad_center[1] * inv),
+        "circles": circles_out,
     }
 
 
 def _red_and_pink_circle_masks(img):
     """Return (target_mask, red_strength, pink_circle_mask)."""
-    b, g, r = cv2.split(img)
+    # Channel slicing returns views; cv2.split would allocate three full copies.
+    b = img[:, :, 0]
+    g = img[:, :, 1]
+    r = img[:, :, 2]
 
     red_strength = cv2.subtract(r, cv2.max(g, b))
     _, m1 = cv2.threshold(red_strength, REDNESS_MIN, 255, cv2.THRESH_BINARY)
@@ -476,7 +522,7 @@ def _red_and_pink_circle_masks(img):
         cv2.bitwise_and(pm3, pm4),
     )
     pink_raw = cv2.morphologyEx(
-        pink_raw, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+        pink_raw, cv2.MORPH_CLOSE, MORPH_KERNEL_3
     )
 
     pink_circle_mask = np.zeros_like(pink_raw)
@@ -529,19 +575,39 @@ def _red_and_pink_circle_masks(img):
 
     target_mask = cv2.bitwise_or(red_mask, pink_circle_mask)
     target_mask = cv2.morphologyEx(
-        target_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+        target_mask, cv2.MORPH_CLOSE, MORPH_KERNEL_3
     )
     return target_mask, red_strength, pink_circle_mask
 
 
 def detect(frame, exp_px, roi=None, prefer=None):
-    """Find the red blob that best matches the expected size. Returns dict or None.
-    roi = (x0, y0, x1, y1) window; prefer = (x, y) favour blobs near this point."""
+    """Find the best red/pink circular target.
+
+    Full-frame SEARCH/fallback detection is downscaled to reduce temporary
+    image/mask allocations.  TRACK ROI detection stays at native resolution.
+    Returned coordinates always use original-frame pixels.
+    """
     x0 = y0 = 0
     img = frame
     if roi is not None:
         x0, y0, x1, y1 = roi
         img = frame[y0:y1, x0:x1]
+
+    scale = 1.0
+    # Only large/full-frame images are reduced. Small tracking ROIs retain
+    # native pixels for precise gimbal centring.
+    if roi is None and DETECT_FULL_SCALE < 0.999:
+        scale = float(DETECT_FULL_SCALE)
+        img = cv2.resize(
+            img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+        )
+
+    exp_work = max(float(exp_px) * scale, 1e-6)
+    prefer_work = None
+    if prefer is not None:
+        prefer_work = ((prefer[0] - x0) * scale,
+                       (prefer[1] - y0) * scale)
+
     mask, red_strength, pink_circle_mask = _red_and_pink_circle_masks(img)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
@@ -550,8 +616,9 @@ def detect(frame, exp_px, roi=None, prefer=None):
         bx, by, bw, bh, area = stats[i]
         if area < MIN_AREA_PX:
             continue
+
         major = max(bw, bh)
-        ratio = major / max(float(exp_px), 1e-6)
+        ratio = major / exp_work
 
         component_labels = (labels[by:by + bh, bx:bx + bw] == i)
         pink_here = pink_circle_mask[by:by + bh, bx:bx + bw]
@@ -560,24 +627,42 @@ def detect(frame, exp_px, roi=None, prefer=None):
             continue
         if major >= 8 and area / float(bw * bh) < MIN_FILL:
             continue
-        cost = abs(math.log(ratio))
-        if prefer is not None:
-            cx, cy = x0 + bx + bw / 2, y0 + by + bh / 2
-            cost += math.hypot(cx - prefer[0], cy - prefer[1]) / max(ROI_HALF_MIN, 4 * exp_px)
+
+        cost = abs(math.log(max(ratio, 1e-6)))
+        if prefer_work is not None:
+            cxw, cyw = bx + bw / 2, by + bh / 2
+            denom = max(ROI_HALF_MIN * scale, 4 * exp_work, 1.0)
+            cost += math.hypot(cxw - prefer_work[0],
+                               cyw - prefer_work[1]) / denom
         if cost < best_cost:
             best_cost, best = cost, (i, bx, by, bw, bh, area)
+
     if best is None:
         return None, mask
 
     i, bx, by, bw, bh, area = best
-    # Colour-weighted centroid for both plain red and pink/magenta targets.
-    b, g, r = cv2.split(img)
+
+    # Channel slicing avoids three extra copies.
+    g = img[:, :, 1]
+    r = img[:, :, 2]
     colour_strength = cv2.max(red_strength, cv2.subtract(r, g))
-    patch = colour_strength[by:by + bh, bx:bx + bw].astype(np.float32) * (labels[by:by + bh, bx:bx + bw] == i)
+    component = (labels[by:by + bh, bx:bx + bw] == i)
+    patch = colour_strength[by:by + bh, bx:bx + bw].astype(np.float32)
+    patch *= component
     m = cv2.moments(patch)
-    cx = x0 + bx + (m["m10"] / m["m00"] if m["m00"] else bw / 2)
-    cy = y0 + by + (m["m01"] / m["m00"] if m["m00"] else bh / 2)
-    return dict(x=cx, y=cy, w=int(bw), h=int(bh), area=int(area)), mask
+    local_x = bx + (m["m10"] / m["m00"] if m["m00"] else bw / 2)
+    local_y = by + (m["m01"] / m["m00"] if m["m00"] else bh / 2)
+
+    inv = 1.0 / scale
+    cx = x0 + local_x * inv
+    cy = y0 + local_y * inv
+    return dict(
+        x=cx,
+        y=cy,
+        w=int(round(bw * inv)),
+        h=int(round(bh * inv)),
+        area=int(round(area * inv * inv)),
+    ), mask
 
 
 # --------------------------- main loop ---------------------------
@@ -596,6 +681,9 @@ def tune_mode(cam):
         R_MIN = cv2.getTrackbarPos("R_MIN", win)
         RED_FRACTION_MIN = cv2.getTrackbarPos("RED_FRACTION_MIN x100", win) / 100.0
         _, mask = detect(frame, 10.0)
+        if mask.shape[:2] != frame.shape[:2]:
+            mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
         view = np.hstack([frame, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)])
         cv2.imshow(win, cv2.resize(view, None, fx=0.4, fy=0.4))
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -627,6 +715,8 @@ def run(args):
     last_logged_circle_count = None
     last_logged_angle = None
     last_event_log_time = 0.0
+    geometry = None
+    geometry_frame_counter = 0
 
     try:
         while True:
@@ -706,7 +796,13 @@ def run(args):
                     result = (mx, my)
                     line += f" | TARGET field=({mx:6.2f}, {my:6.2f}) m +-{sd:.2f}"
 
-            geometry = analyze_object_geometry(frame, prefer=last_pos if det is not None else None)
+            geometry_frame_counter += 1
+            if (geometry is None or
+                    geometry_frame_counter % GEOMETRY_EVERY_N_FRAMES == 0):
+                geometry = analyze_object_geometry(
+                    frame, prefer=last_pos if det is not None else None
+                )
+
             if geometry is not None:
                 visible_circles = len(geometry["circles"])
                 object_angle = geometry["angle"]
@@ -739,33 +835,56 @@ def run(args):
             if dt > 0:
                 fps = 0.9 * fps + 0.1 / dt
             if args.show:
-                view = frame.copy()
+                ds = float(DISPLAY_SCALE)
+                view = cv2.resize(
+                    frame, None, fx=ds, fy=ds, interpolation=cv2.INTER_AREA
+                )
+                vH, vW = view.shape[:2]
 
-                # Display-only correction: real red and round pink/magenta
-                # targets are shown as true red. The source frame is untouched.
+                # Colour correction is done only on the already-small preview.
                 preview_target_mask, _, _ = _red_and_pink_circle_masks(view)
                 view[preview_target_mask != 0] = (0, 0, 255)
 
-                cv2.drawMarker(view, (W // 2, H // 2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
+                cv2.drawMarker(
+                    view, (vW // 2, vH // 2), (255, 255, 255),
+                    cv2.MARKER_CROSS, max(12, int(40 * ds)), 2
+                )
                 if det is not None:
-                    c = (int(det["x"]), int(det["y"]))
-                    cv2.circle(view, c, max(12, int(exp_px)), (0, 255, 0), 2)
-                    cv2.line(view, (W // 2, H // 2), c, (0, 255, 255), 1)
+                    c = (int(round(det["x"] * ds)),
+                         int(round(det["y"] * ds)))
+                    cv2.circle(
+                        view, c, max(6, int(exp_px * ds)),
+                        (0, 255, 0), 2
+                    )
+                    cv2.line(view, (vW // 2, vH // 2), c, (0, 255, 255), 1)
+
                 if geometry is not None:
-                    cv2.drawContours(view, [geometry["contour"]], -1, (255, 0, 255), 2)
+                    q = np.rint(
+                        geometry["contour"].astype(np.float32) * ds
+                    ).astype(np.int32)
+                    cv2.drawContours(view, [q], -1, (255, 0, 255), 2)
                     for circle in geometry["circles"]:
-                        cc = (int(round(circle["center"][0])), int(round(circle["center"][1])))
-                        rr = max(3, int(round(circle["radius"])))
+                        cc = (
+                            int(round(circle["center"][0] * ds)),
+                            int(round(circle["center"][1] * ds)),
+                        )
+                        rr = max(3, int(round(circle["radius"] * ds)))
                         cv2.circle(view, cc, rr, (0, 255, 0), 2)
-                cv2.putText(view, state, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-                cv2.putText(view, f"Viditelne kruhy: {visible_circles}", (20, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+                cv2.putText(view, state, (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                            (255, 255, 255), 2)
+                cv2.putText(view, f"Viditelne kruhy: {visible_circles}",
+                            (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                            (255, 255, 255), 1)
                 tilt_text = f"{object_angle:+.1f}" if object_angle is not None else "N/A"
-                cv2.putText(view, f"Naklon objektu: {tilt_text} stupnu", (20, 125),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                cv2.putText(view, f"FPS: {fps:.1f}", (20, 160),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.imshow("tracker (q = quit)", cv2.resize(view, None, fx=0.5, fy=0.5))
+                cv2.putText(view, f"Naklon objektu: {tilt_text} stupnu",
+                            (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                            (255, 255, 255), 1)
+                cv2.putText(view, f"FPS: {fps:.1f}", (10, 98),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                            (255, 255, 255), 1)
+                cv2.imshow("tracker (q = quit)", view)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             if args.seconds and now - t_start > args.seconds:
