@@ -34,7 +34,8 @@ def parse_args():
     parser.add_argument('--hough', action='store_true', help='Pomalá záloha pro přerušené kruhové hrany (pro porovnání).')
     parser.add_argument('--detector', choices=('geometry', 'red'), default='geometry')
     parser.add_argument('--red-diameter-px', type=float, help='Očekávaný průměr červené tečky v pixelech; jinak bez filtru velikosti.')
-    parser.add_argument('--tuning-file', help='CSI profil; režim red používá ov5647_noir.json. Hodnota none ponechá systémový profil.')
+    parser.add_argument('--tuning-file', help='CSI profil (výchozí ov5647_noir.json: kamera bez IR filtru, jinak růžový obraz). '
+                                              'Hodnota none ponechá systémový profil.')
     parser.add_argument('--output', type=Path, help='Připojuje JSON Lines do souboru; jinak zapisuje na stdout.')
     parser.add_argument('--frames', type=int, help='Ukončit po daném počtu nových snímků.')
     parser.add_argument('--width', type=int, default=640, help='Šířka CSI snímku.')
@@ -100,7 +101,12 @@ def main() -> int:
             if args.servo:
                 # red_tracker.py zapíná serva před kamerou.
                 from src.gimbal import Gimbal
-                stack.enter_context(Gimbal())
+                try:
+                    stack.enter_context(Gimbal())
+                except RuntimeError as error:
+                    if not args.jako_red_tracker:
+                        raise
+                    print(f'Varování: pokračuji bez serv. {error}', file=sys.stderr)
             camera = None
             if args.demo:
                 frame = np.full((480, 640, 3), 35, dtype=np.uint8)
@@ -120,7 +126,7 @@ def main() -> int:
                 device = PiCamera(args.picamera, ev=args.ev,
                                   width=args.width, height=args.height,
                                   tuning_file=(None if args.tuning_file == 'none' else
-                                               args.tuning_file or ('ov5647_noir.json' if args.detector == 'red' else None))) if args.picamera is not None else Camera(args.camera)
+                                               args.tuning_file or 'ov5647_noir.json')) if args.picamera is not None else Camera(args.camera)
                 camera = stack.enter_context(device)
                 frame = camera.read()
             received_at = time.time()

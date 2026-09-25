@@ -42,10 +42,23 @@ class PiCamera:
                 camera.set_controls({'AeEnable': True, 'ExposureValue': self.ev})
             camera.start()
             time.sleep(2)  # Ustálení automatické expozice před prvním snímkem.
+            self._report(camera)
         except BaseException:
             camera.close()
             raise
         self._camera = camera
+
+    def _report(self, camera):
+        # Pro porovnání s red_tracker.py: bez profilu NoIR jsou zisky R/B jiné a obraz růžový.
+        import sys
+        try:
+            metadata = camera.capture_metadata()
+            gains = tuple(round(float(g), 2) for g in metadata['ColourGains'])
+            colour = f'ColourGains {gains}, ColourTemperature {metadata.get("ColourTemperature", "?")} K'
+        except Exception:
+            colour = 'vyvážení barev neznámé'
+        print(f'Kamera: profil {self.tuning_file or "systémový (bez NoIR)"}, '
+              f'{self.size[0]}x{self.size[1]}, {colour}', file=sys.stderr)
 
     def read(self):
         if self._camera is None:
