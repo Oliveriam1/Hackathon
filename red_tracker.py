@@ -55,8 +55,18 @@ TARGET_DIAMETER_M = 0.20
 REDNESS_MIN = 25        # pixel is "red" if R - max(G, B) > this ...
 RED_FRACTION_MIN = 0.35 # ... AND that difference is > this fraction of R (works in shadow too)
 R_MIN = 50              # ... AND R > this (low, so the disc is still found in the drone's shadow)
+# NoIR cameras can render a genuinely red surface as pink/magenta. Pink is
+# accepted only when it forms an approximately round connected component, so
+# unrelated pink areas in the scene are not globally promoted to a target.
+PINK_R_MIN = 80
+PINK_RG_MIN = 22
+PINK_BG_MIN = 8
+PINK_MIN_CHROMA = 30
+PINK_MAX_ASPECT = 1.65
+PINK_MIN_FILL = 0.32
+PINK_MIN_CIRCULARITY = 0.45
 MIN_AREA_PX = 3         # at 20 m the disc is only a few px, keep this small
-SIZE_RATIO = (0.4, 2.5) # accepted blob size vs expected size (rejects red cars, roofs, specks)
+SIZE_RATIO = (0.4, 2.5) # expected-size gate kept for ordinary red blobs
 MIN_FILL = 0.3          # blob area / bounding-box area (only checked for blobs >= 8 px)
 
 # --- field & drone (field coordinates in metres, origin at one corner) ---
@@ -437,6 +447,74 @@ def analyze_object_geometry(frame, prefer=None):
     }
 
 
+def _red_and_pink_circle_masks(img):
+    """Return (target_mask, red_strength, pink_circle_mask)."""
+    b, g, r = cv2.split(img)
+
+    red_strength = cv2.subtract(r, cv2.max(g, b))
+    _, m1 = cv2.threshold(red_strength, REDNESS_MIN, 255, cv2.THRESH_BINARY)
+    _, m2 = cv2.threshold(r, R_MIN, 255, cv2.THRESH_BINARY)
+    m3 = cv2.compare(
+        red_strength,
+        cv2.convertScaleAbs(r, alpha=RED_FRACTION_MIN),
+        cv2.CMP_GT,
+    )
+    red_mask = cv2.bitwise_and(cv2.bitwise_and(m1, m2), m3)
+
+    rg = cv2.subtract(r, g)
+    bg = cv2.subtract(b, g)
+    maxc = cv2.max(cv2.max(r, g), b)
+    minc = cv2.min(cv2.min(r, g), b)
+    chroma = cv2.subtract(maxc, minc)
+
+    _, pm1 = cv2.threshold(r, PINK_R_MIN, 255, cv2.THRESH_BINARY)
+    _, pm2 = cv2.threshold(rg, PINK_RG_MIN, 255, cv2.THRESH_BINARY)
+    _, pm3 = cv2.threshold(bg, PINK_BG_MIN, 255, cv2.THRESH_BINARY)
+    _, pm4 = cv2.threshold(chroma, PINK_MIN_CHROMA, 255, cv2.THRESH_BINARY)
+    pink_raw = cv2.bitwise_and(
+        cv2.bitwise_and(pm1, pm2),
+        cv2.bitwise_and(pm3, pm4),
+    )
+    pink_raw = cv2.morphologyEx(
+        pink_raw, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+    )
+
+    pink_circle_mask = np.zeros_like(pink_raw)
+    contours, _ = cv2.findContours(
+        pink_raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+
+        pixel_area = cv2.countNonZero(pink_raw[y:y + h, x:x + w])
+        if pixel_area < MIN_AREA_PX:
+            continue
+
+        aspect = max(w, h) / float(max(1, min(w, h)))
+        fill = pixel_area / float(w * h)
+        if aspect > PINK_MAX_ASPECT or fill < PINK_MIN_FILL:
+            continue
+
+        if max(w, h) >= 8:
+            area = abs(cv2.contourArea(contour))
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 0.0:
+                continue
+            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+            if circularity < PINK_MIN_CIRCULARITY:
+                continue
+
+        cv2.drawContours(pink_circle_mask, [contour], -1, 255, cv2.FILLED)
+
+    target_mask = cv2.bitwise_or(red_mask, pink_circle_mask)
+    target_mask = cv2.morphologyEx(
+        target_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+    )
+    return target_mask, red_strength, pink_circle_mask
+
+
 def detect(frame, exp_px, roi=None, prefer=None):
     """Find the red blob that best matches the expected size. Returns dict or None.
     roi = (x0, y0, x1, y1) window; prefer = (x, y) favour blobs near this point."""
@@ -445,13 +523,7 @@ def detect(frame, exp_px, roi=None, prefer=None):
     if roi is not None:
         x0, y0, x1, y1 = roi
         img = frame[y0:y1, x0:x1]
-    b, g, r = cv2.split(img)
-    red = cv2.subtract(r, cv2.max(g, b))
-    _, m1 = cv2.threshold(red, REDNESS_MIN, 255, cv2.THRESH_BINARY)
-    _, m2 = cv2.threshold(r, R_MIN, 255, cv2.THRESH_BINARY)
-    m3 = cv2.compare(red, cv2.convertScaleAbs(r, alpha=RED_FRACTION_MIN), cv2.CMP_GT)
-    mask = cv2.bitwise_and(cv2.bitwise_and(m1, m2), m3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    mask, red_strength, pink_circle_mask = _red_and_pink_circle_masks(img)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
     best, best_cost = None, float("inf")
@@ -460,8 +532,12 @@ def detect(frame, exp_px, roi=None, prefer=None):
         if area < MIN_AREA_PX:
             continue
         major = max(bw, bh)
-        ratio = major / exp_px
-        if not (SIZE_RATIO[0] <= ratio <= SIZE_RATIO[1]):
+        ratio = major / max(float(exp_px), 1e-6)
+
+        component_labels = (labels[by:by + bh, bx:bx + bw] == i)
+        pink_here = pink_circle_mask[by:by + bh, bx:bx + bw]
+        is_pink_circle = bool(np.any(component_labels & (pink_here != 0)))
+        if not is_pink_circle and not (SIZE_RATIO[0] <= ratio <= SIZE_RATIO[1]):
             continue
         if major >= 8 and area / float(bw * bh) < MIN_FILL:
             continue
@@ -475,8 +551,10 @@ def detect(frame, exp_px, roi=None, prefer=None):
         return None, mask
 
     i, bx, by, bw, bh, area = best
-    # redness-weighted centroid -> sub-pixel accuracy on tiny blobs
-    patch = red[by:by + bh, bx:bx + bw].astype(np.float32) * (labels[by:by + bh, bx:bx + bw] == i)
+    # Colour-weighted centroid for both plain red and pink/magenta targets.
+    b, g, r = cv2.split(img)
+    colour_strength = cv2.max(red_strength, cv2.subtract(r, g))
+    patch = colour_strength[by:by + bh, bx:bx + bw].astype(np.float32) * (labels[by:by + bh, bx:bx + bw] == i)
     m = cv2.moments(patch)
     cx = x0 + bx + (m["m10"] / m["m00"] if m["m00"] else bw / 2)
     cy = y0 + by + (m["m01"] / m["m00"] if m["m00"] else bh / 2)
@@ -644,16 +722,10 @@ def run(args):
             if args.show:
                 view = frame.copy()
 
-                # Display-only colour correction for the NoIR camera:
-                # pixels that already satisfy the tracker's red criteria are shown
-                # as true red. Detection itself still uses the untouched camera frame.
-                vb, vg, vr = cv2.split(view)
-                vred = cv2.subtract(vr, cv2.max(vg, vb))
-                _, vm1 = cv2.threshold(vred, REDNESS_MIN, 255, cv2.THRESH_BINARY)
-                _, vm2 = cv2.threshold(vr, R_MIN, 255, cv2.THRESH_BINARY)
-                vm3 = cv2.compare(vred, cv2.convertScaleAbs(vr, alpha=RED_FRACTION_MIN), cv2.CMP_GT)
-                preview_red_mask = cv2.bitwise_and(cv2.bitwise_and(vm1, vm2), vm3)
-                view[preview_red_mask != 0] = (0, 0, 255)
+                # Display-only correction: real red and round pink/magenta
+                # targets are shown as true red. The source frame is untouched.
+                preview_target_mask, _, _ = _red_and_pink_circle_masks(view)
+                view[preview_target_mask != 0] = (0, 0, 255)
 
                 cv2.drawMarker(view, (W // 2, H // 2), (255, 255, 255), cv2.MARKER_CROSS, 40, 2)
                 if det is not None:
